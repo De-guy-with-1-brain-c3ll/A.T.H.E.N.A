@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the development computer for ATHENA updates
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=20
+Persistent=true
+
+[Install]
+WantedBy=timers.target

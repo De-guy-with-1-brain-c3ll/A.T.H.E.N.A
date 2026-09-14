@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "athena-assistant"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "aiohttp>=3.10,<4",
+  "beautifulsoup4>=4.12,<5",
+  "jsonschema>=4.23,<5",
+  "lark-oapi>=1.5,<2",
+  "playwright>=1.48,<2",
+  "dashscope>=1.26.4",
+  "openai>=1.0",
+  "PyAudio>=0.2.14",
+  "tzdata>=2024.1; platform_system == 'Windows'",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+athena = ["system/*.txt", "web_static/*"]
+
+[project.scripts]
+athena-tools = "athena.tools.cli:main"
+athena-chat = "athena.text:main"
+athena-feishu = "athena.feishu:main"
+athena-audio-monitor = "athena.audio.telemetry:main"
+athena-web = "athena.web:main"

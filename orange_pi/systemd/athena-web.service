@@ -1,0 +1,32 @@
+[Unit]
+Description=ATHENA local network dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=athena
+Group=athena
+EnvironmentFile=/etc/athena/athena.env
+EnvironmentFile=/etc/athena/web.env
+Environment=ATHENA_DATA_DIR=/opt/athena/data
+WorkingDirectory=/opt/athena/current
+ExecStart=/opt/athena/current/.venv/bin/athena-web --host 0.0.0.0 --port 8780
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+MemoryHigh=500M
+MemoryMax=700M
+TasksMax=100
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/opt/athena/data
+
+[Install]
+WantedBy=multi-user.target

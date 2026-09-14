@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.py[cod]
+.vscode/
+build/
+dist/
+*.egg-info/
+.env
+.env.*
+!.env.example
+API KEY.txt
+output.mp3
+result_24k.pcm
+*.db
+*.db-shm
+*.db-wal
+data/
+data/settings.json
+logs/
+recordings/
+data/coding/
+data/downloads/
+orange_pi/.update-key
+orange_pi/update_feed/

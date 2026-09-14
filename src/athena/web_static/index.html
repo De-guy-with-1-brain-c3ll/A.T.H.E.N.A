@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ATHENA Control</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/audio.css">
+  <link rel="stylesheet" href="/static/music.css">
+</head>
+<body>
+  <div class="scan"></div>
+  <section id="login" class="login card">
+    <div class="mark">A</div>
+    <p class="eyebrow">LOCAL CONTROL NODE</p>
+    <h1>ATHENA</h1>
+    <p class="muted">Enter the dashboard password stored on your Orange Pi.</p>
+    <form id="loginForm">
+      <input id="password" type="password" autocomplete="current-password" placeholder="Dashboard password" required>
+      <button type="submit">Connect</button>
+    </form>
+    <p id="loginError" class="error"></p>
+  </section>
+
+  <main id="app" hidden>
+    <header>
+      <div><p class="eyebrow">ORANGE PI CONTROL NODE</p><h1>ATHENA</h1></div>
+      <div class="status-wrap"><span id="statusDot" class="dot"></span><span id="serviceLabel">Checking…</span></div>
+    </header>
+
+    <nav>
+      <button class="tab active" data-page="command">Command</button>
+      <button class="tab" data-page="history">Conversations</button>
+      <button class="tab" data-page="prompts">Prompts</button>
+      <button id="logout" class="ghost right">Sign out</button>
+    </nav>
+
+    <section id="command" class="page active grid">
+      <article class="card controls">
+        <p class="eyebrow">VOICE SERVICE</p>
+        <h2 id="serviceHeading">Checking status</h2>
+        <div class="control-row">
+          <button data-service="start">Start</button>
+          <button data-service="restart" class="secondary">Restart</button>
+          <button data-service="stop" class="danger">Stop</button>
+        </div>
+        <p id="controlMessage" class="muted">Status refreshes continuously.</p>
+        <section class="music-control" aria-label="Music controls">
+          <div class="music-heading"><p class="eyebrow">NOW PLAYING</p><span id="musicState" class="music-state">IDLE</span></div>
+          <p id="musicTitle" class="music-title">No track loaded</p>
+          <div class="music-buttons">
+            <button id="musicToggle" type="button" aria-label="Pause or resume music">Pause</button>
+            <button id="musicNext" type="button" class="secondary" aria-label="Next track">Next</button>
+            <button id="musicStop" type="button" class="secondary" aria-label="Stop music">Stop</button>
+          </div>
+          <label class="volume-control" for="musicVolume">
+            <span>Music volume</span><output id="musicVolumeLabel">35%</output>
+          </label>
+          <input id="musicVolume" class="volume-slider" type="range" min="0" max="100" step="1" value="35">
+          <p id="musicMessage" class="muted music-message">Controls connect directly to the ATHENA speaker.</p>
+        </section>
+      </article>
+      <article class="card chat-card">
+        <div class="chat-head"><div><p class="eyebrow">DIRECT LINK</p><h2>Talk to ATHENA</h2></div><span id="taskCount" class="pill">READY</span></div>
+        <label class="output-choice">Reply audio
+          <select id="replyOutput">
+            <option value="athena">ATHENA speaker</option>
+            <option value="device">This device</option>
+            <option value="off">Text only</option>
+          </select>
+        </label>
+        <div id="messages" class="messages" aria-live="polite">
+          <div class="message athena">Connected to the local ATHENA node.</div>
+        </div>
+        <form id="chatForm" class="composer">
+          <textarea id="chatInput" rows="1" maxlength="4000" placeholder="Message ATHENA…" required></textarea>
+          <button type="submit" aria-label="Send">Send</button>
+        </form>
+      </article>
+    </section>
+
+    <section id="history" class="page">
+      <article class="card">
+        <div class="section-head"><div><p class="eyebrow">SHARED MEMORY</p><h2>Recent conversations</h2></div><button id="refreshHistory" class="secondary">Refresh</button></div>
+        <p class="muted">Voice, terminal, Feishu, and this dashboard appear here after memory saves them.</p>
+        <div id="conversationList" class="conversation-list"></div>
+      </article>
+    </section>
+
+    <section id="prompts" class="page">
+      <article class="card prompt-card">
+        <p class="eyebrow">BEHAVIOR</p><h2>System prompt</h2>
+        <p class="muted">Controls ATHENA’s personality, priorities, and response style.</p>
+        <textarea id="systemPrompt" class="prompt" spellcheck="false"></textarea>
+      </article>
+      <article class="card prompt-card">
+        <p class="eyebrow">MEMORY</p><h2>Memory prompt</h2>
+        <p class="muted">Controls what ATHENA remembers and summarizes.</p>
+        <textarea id="memoryPrompt" class="prompt" spellcheck="false"></textarea>
+      </article>
+      <div class="save-bar"><span id="saveMessage" class="muted"></span><button id="savePrompts">Save prompts</button></div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

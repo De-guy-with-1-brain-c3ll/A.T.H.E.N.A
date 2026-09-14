@@ -1,0 +1,19 @@
+[Unit]
+Description=Pull and verify an ATHENA update from the development computer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/athena/update.env
+ExecStart=/usr/bin/python3 /opt/athena/update_client.py
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/athena
+NoNewPrivileges=true
+LockPersonality=true

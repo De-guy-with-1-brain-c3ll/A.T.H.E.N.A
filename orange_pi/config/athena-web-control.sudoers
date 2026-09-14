@@ -1,0 +1,1 @@
+athena ALL=(root) NOPASSWD: /usr/bin/systemctl start athena-voice.service, /usr/bin/systemctl stop athena-voice.service, /usr/bin/systemctl restart athena-voice.service
