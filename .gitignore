@@ -22,3 +22,11 @@ data/coding/
 data/downloads/
 orange_pi/.update-key
 orange_pi/update_feed/
+# Measurement artifacts from tools/bench_*.py: generated audio, downloaded models
+# and result JSON. Reproducible from the scripts and far too large for the repo.
+outputs/
+
+# Local assistant/editor bookkeeping, never part of the published project.
+.workbuddy-ai/
+# The Pi's current LAN address; it changes with DHCP.
+orange_pi/pi-address.txt

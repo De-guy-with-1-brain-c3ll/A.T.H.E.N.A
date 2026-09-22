@@ -28,6 +28,10 @@ class NetEasePlayer:
         self._started = asyncio.Event()
         self.last_error = ""
         self.volume = max(0.0, min(1.0, float(os.environ.get("ATHENA_MUSIC_VOLUME", "0.35"))))
+        # Scaling table for the current level, built on first use and dropped
+        # whenever the level changes. Music is scaled ~10 chunks a second, so
+        # the per-sample Python multiply was real work on the Pi.
+        self._volume_table: list[int] | None = None
 
     def suspend_for_voice(self) -> None:
         self._voice_clear.clear()
@@ -37,6 +41,7 @@ class NetEasePlayer:
 
     def set_volume(self, percent: int) -> None:
         self.volume = max(0.0, min(1.0, int(percent) / 100.0))
+        self._volume_table = None
 
     def status(self) -> dict[str, Any]:
         playing = self.task is not None and not self.task.done()
@@ -51,15 +56,24 @@ class NetEasePlayer:
     def _apply_volume(self, pcm: bytes) -> bytes:
         if self.volume >= 0.999:
             return pcm
-        samples = array("h")
+        table = self._volume_table
+        if table is None:
+            # One 65536-entry table per level: entry[u] is the
+            # two's-complement bit pattern of int(sample * volume), with u the
+            # unsigned reading of that sample — identical results to the
+            # per-sample loop it replaces, at lookup speed.
+            volume = self.volume
+            table = [int((u if u < 32768 else u - 65536) * volume) % 65536
+                     for u in range(65536)]
+            self._volume_table = table
+        samples = array("H")
         samples.frombytes(pcm)
         if sys.byteorder != "little":
             samples.byteswap()
-        for index, sample in enumerate(samples):
-            samples[index] = int(sample * self.volume)
+        scaled = array("H", map(table.__getitem__, samples))
         if sys.byteorder != "little":
-            samples.byteswap()
-        return samples.tobytes()
+            scaled.byteswap()
+        return scaled.tobytes()
 
     async def _search(self, query: str) -> list[tuple[str, str]]:
         url = "https://music.163.com/api/search/get/web"
@@ -151,12 +165,21 @@ class NetEasePlayer:
         if self.process is None:
             raise RuntimeError("No NetEase track is playing.")
         if not self.paused:
+            # Windows has no SIGSTOP: asyncio's send_signal raises ValueError
+            # there, which escaped this tool as an unhandled failure. Saying
+            # what is possible beats a crash the user cannot act on.
+            if os.name == "nt":
+                raise RuntimeError(
+                    "Pausing is not supported on this system. "
+                    "Say next or stop instead.")
             self.process.send_signal(signal.SIGSTOP); self.paused = True
 
     async def resume(self) -> None:
         if self.process is None:
             raise RuntimeError("No NetEase track is playing.")
         if self.paused:
+            if os.name == "nt":
+                raise RuntimeError("Music is not paused.")
             self.process.send_signal(signal.SIGCONT); self.paused = False
 
     async def next(self) -> None:

@@ -9,21 +9,22 @@ from uuid import UUID
 
 from openai import AsyncOpenAI
 
+from athena.memory.apply import apply_result
 from athena.memory.database import MemoryDatabase, StoredTurn
+from athena.memory.quality import SENSITIVE_PATTERN as _SENSITIVE
 from athena.settings.store import RuntimeSettingsStore
 from athena.prompts import read_prompt
 
 
-_SENSITIVE = re.compile(
-    r"password|passcode|api[_ -]?key|secret|token|credential|credit[_ -]?card|"
-    r"bank|private[_ -]?key|authentication|\bsk-[a-z0-9._-]+",
-    re.IGNORECASE,
-)
 _SECRET_VALUE = re.compile(
     r"\bsk-[A-Za-z0-9._-]{12,}\b|"
     r"\b(?:api[_ -]?key|app[_ -]?secret|access[_ -]?token|password)\s*[:=]\s*\S+",
     re.IGNORECASE,
 )
+
+
+# How long a turn will wait for the memory queue before giving up on it.
+MEMORY_ENQUEUE_TIMEOUT_SECONDS = 2.0
 
 
 class MemoryService:
@@ -53,6 +54,9 @@ class MemoryService:
         self._facts: list[tuple[str, str, float]] = []
         self._worker_task: asyncio.Task | None = None
         self._concentration_calls = 0
+        # Turns the queue was too busy to accept. Counted so the loss is
+        # visible rather than silent.
+        self.dropped_turns = 0
         self._prompt = read_prompt("memory")
 
     async def connect(self) -> None:
@@ -71,7 +75,7 @@ class MemoryService:
         self._facts = facts
         self._worker_task = asyncio.create_task(self._worker())
 
-    def context_messages(self) -> list[dict[str, str]]:
+    def context_messages(self, *, max_turns: int = 8, max_chars: int = 8_000) -> list[dict[str, str]]:
         if self._settings is not None and not self._settings.get("memory_enabled"):
             return []
         messages: list[dict[str, str]] = []
@@ -81,20 +85,30 @@ class MemoryService:
         if self._facts:
             fact_text = "\n".join(
                 f"- {key}: {value} (confidence {confidence:.2f})"
-                for key, value, confidence in self._facts[:15]
+                for key, value, confidence in self._facts[:8]
             )
             memory_parts.append("Durable facts:\n" + fact_text)
         if memory_parts:
             messages.append(
                 {"role": "system", "content": "Relevant memory:\n" + "\n\n".join(memory_parts)}
             )
-        for turn in self._recent:
+        # Keep voice prompts small. Recent turns are useful for continuity but
+        # old transcripts quickly dominate input-token cost.
+        recent = list(self._recent)[-max(0, int(max_turns)):]
+        used = sum(len(message["content"]) for message in messages)
+        for turn in recent:
+            remaining = max(0, int(max_chars) - used)
+            if remaining < 40:
+                break
+            user = turn.user_text[: max(20, remaining // 2)]
+            assistant = turn.assistant_text[: max(20, remaining - len(user))]
             messages.extend(
                 (
-                    {"role": "user", "content": turn.user_text},
-                    {"role": "assistant", "content": turn.assistant_text},
+                    {"role": "user", "content": user},
+                    {"role": "assistant", "content": assistant},
                 )
             )
+            used += len(user) + len(assistant)
         return messages
 
     async def remember_turn(
@@ -106,7 +120,33 @@ class MemoryService:
             return
         turn = StoredTurn(turn_id, user_text, assistant_text)
         self._recent.append(turn)
-        await self._queue.put(turn)
+        try:
+            # Never let a backed-up memory worker block the conversation. If the
+            # queue is full the turn is already in _recent, so this turn still has
+            # its context; only the durable write is skipped.
+            async with asyncio.timeout(MEMORY_ENQUEUE_TIMEOUT_SECONDS):
+                await self._queue.put(turn)
+        except TimeoutError:
+            self.dropped_turns += 1
+            print(f"Memory is behind; not persisting turn {str(turn_id)[:8]}.",
+                  flush=True)
+
+    async def _save_batch(self, batch: list[StoredTurn]) -> None:
+        """Persist turns, retrying the transient lock contention two processes cause.
+
+        The voice service and the dashboard share one SQLite file, so a write can
+        lose the race for the lock. The old code gave up on the first failure and
+        dropped the turns, silently losing real conversation history.
+        """
+        for attempt in range(3):
+            try:
+                for turn in batch:
+                    await asyncio.to_thread(self._database.save_turn, turn)
+                return
+            except Exception:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.25 * (attempt + 1))
 
     async def _worker(self) -> None:
         pending_summary: list[StoredTurn] = []
@@ -120,8 +160,7 @@ class MemoryService:
             except asyncio.QueueEmpty:
                 pass
             try:
-                for turn in batch:
-                    await asyncio.to_thread(self._database.save_turn, turn)
+                await self._save_batch(batch)
                 pending_summary.extend(batch)
                 batch_size = (self._settings.get("memory_summary_batch_size")
                               if self._settings is not None else 6)
@@ -181,33 +220,11 @@ class MemoryService:
                     )
         if result is None:
             raise ValueError(f"memory model returned invalid JSON twice: {last_error}")
-        forget_keys = [
-            str(key).strip()[:80]
-            for key in result.get("forget_keys", [])[:20]
-            if str(key).strip() and not _SENSITIVE.search(str(key))
-        ]
-        await asyncio.to_thread(self._database.delete_facts, forget_keys)
-        summary = str(result.get("summary", "")).strip()[:2000]
-        if summary and not _SENSITIVE.search(summary):
-            await asyncio.to_thread(self._database.save_summary, summary)
-            self._summary = summary
-
-        source_turn = turns[-1].turn_id
-        for fact in result.get("facts", [])[:8]:
-            key = str(fact.get("key", "")).strip()[:80]
-            value = str(fact.get("value", "")).strip()[:500]
-            confidence = max(0.0, min(1.0, float(fact.get("confidence", 0))))
-            if (
-                not key
-                or not value
-                or confidence < 0.65
-                or _SENSITIVE.search(key)
-                or _SENSITIVE.search(value)
-            ):
-                continue
-            await asyncio.to_thread(
-                self._database.upsert_fact, key, value, confidence, source_turn
-            )
+        # The same gate sleep mode uses, in one place: sensitive data, the quality
+        # rules, and the cap on how large the table may grow.
+        applied = await apply_result(self._database, result, turns[-1].turn_id)
+        if applied.summary_chars:
+            self._summary = await asyncio.to_thread(self._database.get_summary)
         self._facts = await asyncio.to_thread(self._database.facts, 20)
 
     async def close(self) -> None:

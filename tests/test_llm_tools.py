@@ -39,6 +39,39 @@ class Stream:
 
 
 class LLMToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_repeated_tool_call_id_is_not_duplicated(self):
+        """Providers repeat the id on later deltas; appending broke the next call."""
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ToolRegistry.discover(services={"settings": None})
+            model = DeepSeekLanguageModel('test', 'test', registry,
+                RuntimeSettingsStore(Path(directory) / 'settings.json'))
+            arguments = json.dumps({"timezone": "UTC"})
+            # The same id and name on both deltas, with the arguments split.
+            first = NS(index=0, id='call_abc',
+                       function=NS(name='get_local_time', arguments=arguments[:8]))
+            second = NS(index=0, id='call_abc',
+                        function=NS(name='get_local_time', arguments=arguments[8:]))
+            model._client.chat.completions.create = AsyncMock(side_effect=[
+                Stream([chunk(calls=[first]), chunk(calls=[second])]),
+                Stream([chunk('It is the right time.')]),
+            ])
+            try:
+                answer = ''.join([part async for part in model.stream_reply(
+                    uuid4(), 'please check the current time for me')])
+                self.assertIn('right time', answer)
+                sent = model._client.chat.completions.create.await_args_list[1].kwargs['messages']
+                tool_messages = [item for item in sent if item.get('role') == 'tool']
+                self.assertEqual(len(tool_messages), 1)
+                self.assertEqual(tool_messages[0]['tool_call_id'], 'call_abc',
+                                 "the tool call id was duplicated across deltas")
+                assistant = [item for item in sent
+                             if item.get('role') == 'assistant' and item.get('tool_calls')][0]
+                self.assertEqual(assistant['tool_calls'][0]['id'], 'call_abc')
+                self.assertEqual(assistant['tool_calls'][0]['function']['name'],
+                                 'get_local_time')
+            finally:
+                await model.close()
+
     async def test_model_written_command_approval_is_replaced_by_real_tool_grant(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

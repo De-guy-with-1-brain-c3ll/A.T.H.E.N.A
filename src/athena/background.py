@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import UUID, uuid4
 
 @dataclass
@@ -14,6 +14,13 @@ class Job:
     forked: bool = False
     task: asyncio.Task | None = None
     reply: str | None = None
+    # The voice coordinator used to receive only `reply`, after the entire model
+    # stream had been joined.  That made a streaming model and streaming TTS wait
+    # for the whole answer anyway.  Keep the fragments as they arrive so playback
+    # can start with the first complete speakable clause.
+    reply_fragments: asyncio.Queue[str | None] = field(default_factory=asyncio.Queue)
+    reply_started: bool = False
+    delivery_started: bool = False
     acknowledged: bool = False
     acknowledgement_due: bool = False
 
@@ -93,8 +100,15 @@ class BackgroundAgents:
         web_heavy = re.search(r"\b(?:web|website|browse|browser|search|download|internet)\b", job.text.casefold())
         timer = asyncio.get_running_loop().call_later(0.15 if web_heavy else 1.25, acknowledge)
         try:
-            job.reply = "".join([part async for part in job.model.stream_reply(
-                job.id, job.text, context, on_connected=acknowledge)])
+            parts: list[str] = []
+            async for part in job.model.stream_reply(
+                    job.id, job.text, context, on_connected=acknowledge):
+                parts.append(part)
+                await job.reply_fragments.put(part)
+                if not job.reply_started:
+                    job.reply_started = True
+                    self.changed.set()
+            job.reply = "".join(parts)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -103,6 +117,10 @@ class BackgroundAgents:
                          else "That request failed. Please try again.")
         finally:
             timer.cancel()
+            # The consumer must be ended even when a provider fails or is
+            # cancelled; otherwise it would wait forever after speaking the
+            # first few fragments.
+            await job.reply_fragments.put(None)
             self.changed.set()
 
     def next_output(self):
@@ -112,7 +130,7 @@ class BackgroundAgents:
         # Prefer a real answer over filler. Never replace an unanswered approval
         # with a second approval that could make a subsequent yes ambiguous.
         for job in self.jobs.values():
-            if job.reply is not None:
+            if (job.reply_started or job.reply is not None) and not job.delivery_started:
                 # A prepared prompt may wait behind another approval. Its timer
                 # starts only when the prompt is actually delivered.
                 pending = job.model._tools._pending is not None
@@ -123,6 +141,14 @@ class BackgroundAgents:
             if job.reply is None and job.acknowledgement_due and not job.acknowledged:
                 return job, True
         return None
+
+    async def reply_stream(self, job: Job):
+        """Yield one job's model output as it becomes available."""
+        while True:
+            fragment = await job.reply_fragments.get()
+            if fragment is None:
+                return
+            yield fragment
 
     def delivered(self, job):
         if job.model._tools._pending is not None:

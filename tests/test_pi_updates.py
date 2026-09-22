@@ -73,7 +73,7 @@ class PiUpdateTests(unittest.TestCase):
 
     def test_linux_sandbox_and_shell_are_restricted(self):
         command = bubblewrap_command('/usr/bin/bwrap', '/usr/bin/python3')
-        for value in ('--unshare-all', '--die-with-parent', '--ro-bind', '--tmpfs', '-I'):
+        for value in ('--unshare-all', '--die-with-parent', '--tmpfs', '-I'):
             self.assertIn(value, command)
         compile(RUNNER, 'sandbox_runner', 'exec')
         with patch('athena.tools.command.os.name', 'posix'):
@@ -84,6 +84,47 @@ class PiUpdateTests(unittest.TestCase):
                 CommandTool._validate('rm -rf /tmp/example', 'bash')
             with self.assertRaises(ValueError):
                 CommandTool._validate('rm --recursive --force /tmp/example', 'bash')
+
+    def test_linux_sandbox_never_exposes_the_host_filesystem(self):
+        """Coding runs without approval, so its sandbox must not see secrets."""
+        def sources(command):
+            return [command[index + 1] for index, item in enumerate(command)
+                    if item == '--ro-bind']
+
+        # On a host where the usual runtime paths exist, only those are bound.
+        with patch('athena.tools._sandbox.os.path.exists',
+                   lambda path: path in {'/usr', '/lib', '/etc/ld.so.cache'}), \
+             patch('athena.tools._sandbox.os.path.isdir',
+                   lambda path: path in {'/usr', '/lib'}), \
+             patch('athena.tools._sandbox.os.path.isfile',
+                   lambda path: path == '/etc/ld.so.cache'), \
+             patch('athena.tools._sandbox.os.path.realpath', lambda path: path):
+            command = bubblewrap_command('/usr/bin/bwrap', '/usr/bin/python3')
+        self.assertEqual(sources(command), ['/usr', '/lib', '/etc/ld.so.cache'])
+
+        # The whole host root must never be mounted, on any host.
+        self.assertNotIn('/', sources(command))
+        for secret in ('/etc/athena', '/opt/athena', '/root', '/home', '/var'):
+            self.assertNotIn(secret, sources(command))
+
+    def test_linux_sandbox_binds_the_resolved_path_for_symlinked_dirs(self):
+        """Debian symlinks /lib and /bin into /usr; the visible name must exist."""
+        with patch('athena.tools._sandbox.os.path.exists', lambda path: path == '/lib'), \
+             patch('athena.tools._sandbox.os.path.isdir', lambda path: path == '/lib'), \
+             patch('athena.tools._sandbox.os.path.realpath', lambda path: '/usr/lib'):
+            command = bubblewrap_command('/usr/bin/bwrap', '/usr/bin/python3')
+        index = command.index('--ro-bind')
+        self.assertEqual(command[index + 1:index + 3], ['/usr/lib', '/lib'])
+
+    def test_the_env_examples_define_each_setting_once(self):
+        """A duplicated key silently overrides the earlier one at startup."""
+        for name in ('.env.example', 'orange_pi/config/athena.env.example'):
+            with self.subTest(file=name):
+                text = (PROJECT / name).read_text(encoding='utf-8')
+                keys = [line.split('=', 1)[0] for line in text.splitlines()
+                        if line.strip() and not line.lstrip().startswith('#')]
+                duplicates = sorted({key for key in keys if keys.count(key) > 1})
+                self.assertEqual(duplicates, [], f"{name} repeats {duplicates}")
 
     def test_pi_install_is_non_editable_and_uses_final_release_path(self):
         command = updater.pip_install_command(
@@ -138,3 +179,55 @@ class PiUpdateTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SystemEnvironmentFileTests(unittest.TestCase):
+    """A tool run by hand on the Pi must see what the services see.
+
+    systemd injects /etc/athena/athena.env for the services. A command-line tool
+    started from a shell has no such environment, so without this fallback every
+    tool reported "not configured" on a fully configured Pi.
+    """
+
+    def _cleanup(self, name):
+        import os
+        os.environ.pop(name, None)
+
+    def test_the_system_file_supplies_missing_settings(self):
+        import os
+        from unittest.mock import patch
+
+        from athena import config
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "athena.env"
+            path.write_text("# a comment\nATHENA_TEST_MARKER=from-the-system-file\n",
+                            encoding="utf-8")
+            self._cleanup("ATHENA_TEST_MARKER")
+            with patch.object(config, "SYSTEM_ENV_FILE", path):
+                config.load_local_environment()
+                self.assertEqual(os.environ.get("ATHENA_TEST_MARKER"), "from-the-system-file")
+            self._cleanup("ATHENA_TEST_MARKER")
+
+    def test_an_existing_variable_is_never_overridden(self):
+        import os
+        from unittest.mock import patch
+
+        from athena import config
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "athena.env"
+            path.write_text("ATHENA_TEST_MARKER=from-the-file\n", encoding="utf-8")
+            with patch.object(config, "SYSTEM_ENV_FILE", path):
+                os.environ["ATHENA_TEST_MARKER"] = "from-the-environment"
+                config.load_local_environment()
+                self.assertEqual(os.environ["ATHENA_TEST_MARKER"], "from-the-environment")
+            self._cleanup("ATHENA_TEST_MARKER")
+
+    def test_a_missing_system_file_is_not_an_error(self):
+        from unittest.mock import patch
+
+        from athena import config
+
+        with patch.object(config, "SYSTEM_ENV_FILE", Path("/nonexistent/athena.env")):
+            config.load_local_environment()  # must not raise

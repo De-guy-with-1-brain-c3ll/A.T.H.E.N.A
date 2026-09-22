@@ -16,3 +16,25 @@
   color: var(--text);
   font: inherit;
 }
+
+/* Live microphone level. Driven by the real captured signal, so a bar that
+   moves while the room is silent means the wrong input is selected. */
+.meter {
+  height: 8px;
+  margin: 14px 0 10px;
+  border-radius: 4px;
+  background: #0b1a22;
+  overflow: hidden;
+}
+
+.meter span {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: var(--accent, #35d0ba);
+  transition: width 90ms linear;
+}
+
+.mic-live {
+  color: var(--accent, #35d0ba);
+}

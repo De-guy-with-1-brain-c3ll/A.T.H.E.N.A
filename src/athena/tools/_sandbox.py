@@ -52,13 +52,42 @@ def docker_command(executable: str, name: str) -> list[str]:
             "--interactive", IMAGE, "python", "-u", "-c", RUNNER]
 
 
+# Only the system runtime is visible inside the bubblewrap sandbox. Binding the
+# whole root ("--ro-bind / /") would expose ATHENA's own credentials
+# (/etc/athena/athena.env is readable by the service account), the conversation
+# database, and the Microsoft token cache to AI-written code — and coding_workspace
+# runs without user approval, so a prompt-injected web page could print those
+# secrets into the model's next request.
+BWRAP_READ_ONLY = ("/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin",
+                   "/etc/alternatives", "/etc/ld.so.cache", "/etc/ld.so.conf",
+                   "/etc/ld.so.conf.d", "/etc/nsswitch.conf", "/etc/passwd",
+                   "/etc/group", "/etc/localtime", "/etc/timezone")
+
+
 def bubblewrap_command(executable: str, python: str) -> list[str]:
-    """Lightweight Linux sandbox suitable for a small ARM SBC."""
-    return [executable, "--unshare-all", "--new-session", "--die-with-parent",
-            "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-            "--tmpfs", "/work", "--tmpfs", "/tmp", "--chdir", "/work",
-            "--setenv", "HOME", "/tmp", "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
-            python, "-I", "-u", "-c", RUNNER]
+    """Lightweight Linux sandbox suitable for a small ARM SBC.
+
+    Every bind is read-only and limited to the system runtime. Anything holding
+    ATHENA's secrets (``/etc/athena``, ``/opt/athena``, home directories) is
+    simply absent rather than mounted, so there is nothing to escape into.
+    """
+    command = [executable, "--unshare-all", "--new-session", "--die-with-parent",
+               "--dev", "/dev", "--proc", "/proc"]
+    for path in BWRAP_READ_ONLY:
+        if not os.path.exists(path):
+            continue
+        # Bind the resolved directory at the visible path: on Debian /lib and
+        # /bin are symlinks into /usr, and the ELF interpreter is opened through
+        # the symlinked name, so the visible path must exist inside the sandbox.
+        source = os.path.realpath(path)
+        if os.path.isdir(path):
+            command += ["--ro-bind", source, path]
+        elif os.path.isfile(path):
+            command += ["--ro-bind", path, path]
+    command += ["--tmpfs", "/work", "--tmpfs", "/tmp", "--chdir", "/work",
+                "--setenv", "HOME", "/tmp", "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
+                python, "-I", "-u", "-c", RUNNER]
+    return command
 
 
 async def _collect(stream):

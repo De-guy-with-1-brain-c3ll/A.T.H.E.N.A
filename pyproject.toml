@@ -14,7 +14,17 @@ dependencies = [
   "playwright>=1.48,<2",
   "dashscope>=1.26.4",
   "openai>=1.0",
+  "msal>=1.31,<2",
   "PyAudio>=0.2.14",
+  # Optional local speech, used when ATHENA_STT_BACKEND=sensevoice or
+  # ATHENA_TTS_BACKEND=sherpa. It is a small wheel with a self-contained ONNX
+  # runtime and it carries CPU-only aarch64 builds, so it costs little to install
+  # even on a machine that will keep using the cloud services.
+  "sherpa-onnx>=1.13,<2",
+  # The Edge voice, used when ATHENA_TTS_BACKEND=edge. Small, pure Python, no
+  # account or key — it speaks the Edge browser's own protocol. Also needs
+  # ffmpeg on PATH, because Edge only returns MP3 and the speaker wants PCM.
+  "edge-tts>=7,<8",
   "tzdata>=2024.1; platform_system == 'Windows'",
 ]
 
@@ -22,7 +32,7 @@ dependencies = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-athena = ["system/*.txt", "web_static/*"]
+athena = ["system/*.txt", "web_static/*", "*.html"]
 
 [project.scripts]
 athena-tools = "athena.tools.cli:main"
@@ -30,3 +40,6 @@ athena-chat = "athena.text:main"
 athena-feishu = "athena.feishu:main"
 athena-audio-monitor = "athena.audio.telemetry:main"
 athena-web = "athena.web:main"
+athena-teams-login = "athena.tools.teams:login"
+athena-teams-check = "athena.tools.teams:check"
+athena-sleep = "athena.sleep:main"

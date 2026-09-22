@@ -23,6 +23,46 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.data["timezone"], "UTC")
 
+    async def test_every_interface_gets_a_shared_sleep_record(self):
+        """Same failure the alarms had: a tool that works in one interface only.
+
+        Built through `build_registry`, both sleep tools must be discovered and
+        must already have their shared state, or `sleep_status` reports "never"
+        on a machine that consolidates nightly.
+        """
+        import tempfile
+        from pathlib import Path
+
+        from athena.services import build_registry
+        from athena.settings.store import RuntimeSettingsStore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            settings = RuntimeSettingsStore(Path(directory) / "settings.json")
+            registry, _alerts = build_registry(settings)
+            self.assertIn("sleep_mode", registry.names())
+            self.assertIn("sleep_status", registry.names())
+            self.assertIsNotNone(registry.get("sleep_mode").runner)
+            self.assertIsNotNone(registry.get("sleep_status").store)
+
+    async def test_the_sleep_status_tool_answers_through_the_registry(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from athena.services import build_registry
+        from athena.settings.store import RuntimeSettingsStore
+        from athena.sleep import SleepStatusStore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            # Point the status file somewhere empty so the answer is deterministic.
+            empty = SleepStatusStore(Path(directory) / "sleep-status.json")
+            with patch("athena.tools.sleep.SleepStatusStore", lambda *a, **k: empty):
+                settings = RuntimeSettingsStore(Path(directory) / "settings.json")
+                registry, _alerts = build_registry(settings)
+                result = await registry.execute("sleep_status", {})
+            self.assertTrue(result.success)
+            self.assertIn("not consolidated", result.spoken_text)
+
     async def test_browser_diagnostic_runs_browser_not_search(self):
         registry = ToolRegistry()
         browser = DiagnosticTool('browse_webpage', ToolResult(True, 'read', {'text': 'Example Domain'}))

@@ -19,6 +19,12 @@ import zipfile
 
 MAX_BUNDLE_BYTES = 50 * 1024 * 1024
 
+# Creating a virtual environment copies the interpreter and runs ensurepip, which
+# a Pi Zero 3's CPU and SD card cannot always finish inside two minutes. This is
+# not a safety limit on untrusted work — it only bounds a local, root-owned
+# `python -m venv` — so it is generous on purpose.
+VENV_BUILD_TIMEOUT_SECONDS = 600
+
 
 def signing_payload(manifest: dict) -> bytes:
     return (f"{manifest['schema']}\n{manifest['version']}\n{manifest['archive']}\n"
@@ -166,7 +172,14 @@ def install_release(root: Path, manifest: dict, bundle: bytes, service: str) -> 
         # Move the source into its permanent absolute path before creating the
         # venv because console-script shebangs contain that absolute path.
         staging.rename(release)
-        subprocess.run([sys.executable, "-m", "venv", str(release / ".venv")], check=True, timeout=120)
+        # Building a venv copies the interpreter and runs ensurepip, which is
+        # slow on a Pi Zero 3's CPU and SD card. Measured 2026-09-18: it exceeded
+        # 120 seconds and the update failed with a bare timeout *after* the
+        # release had already downloaded and verified — so the fix looked like a
+        # bad download rather than a short clock. The pip step below already had
+        # 900 seconds for the same reason.
+        subprocess.run([sys.executable, "-m", "venv", str(release / ".venv")],
+                       check=True, timeout=VENV_BUILD_TIMEOUT_SECONDS)
         python = release / ".venv" / "bin" / "python"
         subprocess.run(pip_install_command(python, root, release), check=True, timeout=900)
         subprocess.run([str(python), "-m", "compileall", "-q", str(release / "src")],

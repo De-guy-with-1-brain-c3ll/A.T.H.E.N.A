@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import pkgutil
 import copy
 import re
@@ -13,6 +14,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
+from athena.alerts import AlertScheduler
 from athena.tools.models import PermissionLevel, Tool, ToolResult
 
 
@@ -34,11 +36,41 @@ class ToolRegistry:
                "yes approve download", "yes download it", "download it", "go ahead", "approved"}
     DENY = {"no", "no thanks", "no thank you", "cancel", "cancel download", "deny download"}
 
+    # Local alarm phrasings. Group 1 is the time, group 2 is the optional message.
+    # Ways people ask what is scheduled. Narrow patterns here sent the question
+    # to the model, which then had no alarm state and could answer from memory.
+    ALARM_LIST_PATTERN = re.compile(
+        r"\b(?:list|show|what|whats)\s+(?:my\s+|the\s+)?(?:alarms?|timers?|reminders?)\b"
+        r"|\b(?:do\s+i\s+have|are\s+there|have\s+i)\s+(?:any\s+)?(?:alarms?|timers?|reminders?)\b"
+        r"|\bany\s+(?:active\s+)?(?:alarms?|timers?|reminders?)\b")
+
+    ALARM_PATTERNS = (
+        r"\b(?:set|create|start|make)\s+(?:an?\s+)?(?:alarm|timer|reminder)\s+(?:in|at|for)\s+"
+        r"(.+?)(?:\s+(?:to|saying|that)\s+(.+))?$",
+        r"\bremind\s+me\s+(?:in|at|on)\s+(.+?)(?:\s+(?:to|that|saying)\s+(.+))?$",
+        r"\bwake\s+me(?:\s+up)?\s+(?:in|at)\s+(.+?)(?:\s+(?:to|for|saying|that)\s+(.+))?$",
+        r"\b(?:set|create|start|make)\s+(?:an?\s+)?(.+?)\s+(?:alarm|timer|reminder)\b"
+        r"(?:\s+(?:to|saying|that)\s+(.+))?$",
+        r"^(?:set\s+)?(?:an?\s+)?(?:alarm|timer|reminder)\s+(?:in|at|for)\s+"
+        r"(.+?)(?:\s+(?:to|saying|that)\s+(.+))?$",
+    )
+
     @staticmethod
     def normalize_command(text):
         # Normalize punctuation but never discard non-English letters into a fake yes.
         text = unicodedata.normalize("NFKC", text).casefold()
         return " ".join(re.sub(r"[^\w\s]", " ", text).split())
+
+    @staticmethod
+    def soften_command(text):
+        """Lowercase and collapse whitespace while keeping meaningful punctuation.
+
+        normalize_command() removes every punctuation mark, which destroys clock
+        times: "7:30 pm" becomes "7 30 pm" and can no longer be parsed. Times must
+        therefore be read from text that still has its punctuation.
+        """
+        text = unicodedata.normalize("NFKC", str(text)).casefold()
+        return " ".join(text.split())
 
     @property
     def has_pending_download(self):
@@ -244,9 +276,69 @@ class ToolRegistry:
         self._retry_action = None if prompt.data.get("approval_required") else "armbian_imager"
         return prompt
 
+    def alarm_request(self, text: str):
+        """Return (time, message) for a local alarm request, or None.
+
+        Reads the original text, not the punctuation-stripped form, because
+        normalize_command() turns "7:30 pm" into "7 30 pm" and the time can no
+        longer be parsed.
+        """
+        spoken = self.soften_command(text)
+        for pattern in self.ALARM_PATTERNS:
+            match = re.search(pattern, spoken)
+            if not match:
+                continue
+            when = (match.group(1) or "").strip()
+            message = (match.group(2) or "").strip()
+            if not when:
+                continue
+            # The lazy group stops at the keyword, so "set a ten minute rest
+            # timer" leaves "ten minute rest" as the time. Give the trailing
+            # words back to the message until the time parses, so a label like
+            # "rest" does not make the whole request unparseable.
+            words = when.split()
+            original = (when, message or "Your alarm is due.")
+            while words:
+                candidate = " ".join(words)
+                try:
+                    AlertScheduler.parse_when(candidate)
+                except ValueError:
+                    message = " ".join([words.pop(), message]).strip()
+                    continue
+                return candidate, message or "Your alarm is due."
+            # Nothing parsed at all. Return the original wording so the alarm tool
+            # reports the real "use a time like..." error, instead of the request
+            # quietly reaching the model, which has no idea what time he meant.
+            return original
+        return None
+
     async def handle_user_command(self, text: str) -> ToolResult | None:
         """Called ONLY on a fresh user transcript, never on model or website text."""
         command = self.normalize_command(text)
+        # Routine alarms stay local: no DeepSeek request and no token cost.
+        if "set_alarm" in self._tools:
+            request = self.alarm_request(text)
+            if request is not None:
+                when, message = request
+                return await self.execute("set_alarm", {"when": when, "message": message})
+        if "list_alarms" in self._tools and self.ALARM_LIST_PATTERN.search(command):
+            return await self.execute("list_alarms", {})
+        if "cancel_alarm" in self._tools:
+            # The id charset is deliberately wider than the generated ids: an
+            # unmatched cancel used to fall through to the model, which could
+            # confirm a cancellation that never happened. Answering honestly is
+            # always better than silence or invention.
+            cancel_match = re.search(r"\bcancel\s+(?:alarm\s+|timer\s+|reminder\s+)?([a-z0-9]{4,20})\b",
+                                     command)
+            if cancel_match:
+                return await self.execute("cancel_alarm", {"alarm_id": cancel_match.group(1)})
+        if "list_watches" in self._tools and re.search(
+                r"\b(?:list|show|what are)\s+(?:my\s+)?(?:watches|alerts|notifications)\b", command):
+            return await self.execute("list_watches", {})
+        if "cancel_watch" in self._tools:
+            watch_match = re.search(r"\bcancel\s+(?:watch|alert|notification)\s+([a-f0-9]{4,20})\b", command)
+            if watch_match:
+                return await self.execute("cancel_watch", {"watch_id": watch_match.group(1)})
         music = self._tools.get("netease_music")
         if music is not None:
             if (re.search(r"\b(?:pause|resume|continue|stop|skip|next)\b", command)
@@ -275,6 +367,12 @@ class ToolRegistry:
                 "browse_webpage": "Chromium browsing", "coding_workspace": "isolated coding and tests",
                 "run_command": "approved computer commands", "download_file": "approved downloads",
                 "manage_settings": "settings", "shutdown_athena": "assistant shutdown",
+                "set_alarm": "alarms", "list_alarms": "alarm status",
+                "watch_teams_channel": "new Teams message alerts",
+                "watch_weather": "weather alerts",
+                "list_watches": "background alert status",
+                "teams_assignments": "Teams assignments and due dates",
+                "teams_channel_posts": "Teams channel posts",
             }
             available = [label for name, label in capabilities.items() if name in self._tools]
             return ToolResult(True, "I can use " + ", ".join(available) + ".")
@@ -437,6 +535,19 @@ class ToolRegistry:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        # Let tools release pooled resources. The Teams tools hold one shared
+        # HTTP session for the whole process so they do not repeat a TLS
+        # handshake on every request; without this it is left unclosed.
+        for tool in self._tools.values():
+            closer = getattr(tool, "close", None)
+            if not callable(closer):
+                continue
+            try:
+                result = closer()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                continue
 
     async def wait_for_downloads(self):
         await asyncio.gather(*list(self._download_tasks), return_exceptions=True)

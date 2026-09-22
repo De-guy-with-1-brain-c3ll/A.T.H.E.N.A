@@ -9,3 +9,4 @@ class AgentState(Enum):
     SPEAKING = "speaking"
     CANCELLING = "cancelling"
     RECOVERING = "recovering"
+    SLEEPING = "sleeping"

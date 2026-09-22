@@ -20,13 +20,14 @@ from lark_oapi.api.im.v1 import (
     P2ImMessageReceiveV1,
 )
 
+from athena.alerts import AlertScheduler
 from athena.background import BackgroundAgents
 from athena.config import load_local_environment
 from athena.llm.deepseek import DeepSeekLanguageModel
 from athena.memory.service import MemoryService
 from athena.paths import data_directory, database_path
+from athena.services import build_registry
 from athena.settings.store import RuntimeSettingsStore
-from athena.tools.registry import ToolRegistry
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,7 +314,7 @@ def _build():
     if missing:
         raise ValueError("Add these values to the project .env file: " + ", ".join(missing))
     settings = RuntimeSettingsStore()
-    registry = ToolRegistry.discover(services={"settings": settings})
+    registry, alerts = build_registry(settings)
     model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash").strip()
     model = DeepSeekLanguageModel(deepseek_key, model_name, registry, settings, interface="text")
     memory = MemoryService(database_path(), deepseek_key, model_name,
@@ -322,20 +323,35 @@ def _build():
                           os.environ.get("FEISHU_ALLOWED_OPEN_IDS", ""))
     transport = FeishuTransport(app_id, app_secret)
     gateway = FeishuGateway(model, memory, registry, transport.send_text, access)
-    return gateway, transport, memory
+    return gateway, transport, memory, alerts
 
 
 async def run():
-    gateway, transport, memory = _build()
+    gateway, transport, memory, alerts = _build()
+    # An alarm must reach the person who set it, so deliver it to every paired
+    # Feishu account rather than dropping it into the service log.
+    async def notify(text: str) -> bool:
+        recipients = sorted(gateway.access.allowed)
+        if not recipients:
+            print(f"ATHENA alarm: {text}")
+            return False
+        delivered = False
+        for open_id in recipients:
+            delivered = await gateway._send(open_id, text) or delivered
+        return delivered
+
+    alerts.notify = notify
     await memory.connect()
     if gateway.access.pairing_code:
         print("Feishu pairing code:", gateway.access.pairing_code)
         print(f"Send /pair {gateway.access.pairing_code} to your ATHENA bot in a private Feishu chat.")
     transport.start_socket_thread(gateway)
     print("ATHENA Feishu connector is running. Press Ctrl+C to stop.")
+    await alerts.start()
     try:
         await gateway.run()
     finally:
+        await alerts.close()
         await gateway.close()
         await asyncio.gather(gateway.model.close(), memory.close(), return_exceptions=True)
 

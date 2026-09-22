@@ -184,6 +184,79 @@ The less specific "Armbian download" asks whether the user means the Imager or a
 operating-system image. Signature assets such as `.exe.sig` cannot be mistaken for
 the actual installer.
 
+## Proactive alerts (new Teams messages, weather)
+
+ATHENA can speak up without being asked. Two background checks are available and
+they never call DeepSeek, so an alert costs no answer tokens:
+
+- **New Teams messages.** "Watch the General channel in Class for new messages"
+  creates a recurring read-only check of that channel. The first check only
+  records what is already there, so creating the watch never replays history at
+  you. Later checks announce up to three new posts (author, channel, and the
+  message text with its HTML stripped) and summarise the remainder. Read-only,
+  using the same delegated Graph access as `teams_channel_posts`.
+- **Weather.** "Tell me the weather every morning at seven" schedules a daily
+  local briefing, and "warn me if it is going to rain" adds an umbrella warning
+  once the chance of precipitation reaches the threshold you set. Forecasts come
+  from the same Open-Meteo source as `get_weather`, with the same attribution.
+
+```powershell
+python -m athena.tools call watch_weather '{"location":"Shanghai","at":"07:30","alert_if_rain_over":60}'
+python -m athena.tools call watch_teams_channel '{"team":"Class","channel":"General","minutes":5}'
+python -m athena.tools call list_watches '{}'
+python -m athena.tools call cancel_watch '{"watch_id":"1a2b3c4d"}'
+```
+
+Watches are stored beside alarms in `data/alerts.json` and survive restarts. The
+shortest interval is 60 seconds, so a watch cannot be used to hammer a service.
+A check that fails stays silent rather than talking over you; asking ATHENA about
+it directly still reports the real error. Delivery uses whichever interface owns
+the scheduler: the room speaker in voice mode, the paired chat in Feishu, the
+voice service through the dashboard.
+
+## Speech recognition cost and latency
+
+DashScope bills speech recognition per **second of input audio**; the transcript
+itself is free. There is no STT token cost, so the levers are how much audio
+reaches the service and which model receives it.
+
+Real-time options (China list price, CNY per audio second, each with a 36,000 s
+free quota valid for 90 days):
+
+| Model | CNY/sec | Notes |
+| --- | --- | --- |
+| `qwen-audio-3.0-asr-flash-streaming` | 0.00033 | Newest generation; multilingual plus dialects, any sample rate. Default. |
+| `fun-asr-realtime` | 0.00033 | Multilingual; also speaks the AOQ protocol, which holds up better on weak networks. |
+| `qwen3-asr-flash-realtime` | 0.00033 | 16 kHz only; configurable turn detection plus a manual mode. |
+| `fun-asr-flash-8k-realtime` | 0.00022 | Cheapest real-time option, but Chinese only and 8 kHz. |
+
+Paraformer is the previous generation and Alibaba recommends migrating away from
+it. Its file-transcription model is cheaper still, but it is not real-time.
+
+At three seconds of speech per utterance and a hundred utterances a day, the
+common models cost about 3 CNY a month. ATHENA only sends audio while its own
+voice gate is open, so silence costs nothing.
+
+`python -m athena.dev.harness stt` prints the same comparison for your own usage.
+
+### Latency
+
+Three things delay a transcript, in the order they are paid:
+
+1. the voice gate confirming speech onset (~100 ms, local);
+2. the DashScope websocket handshake;
+3. the service finalising the last sentence.
+
+Step 2 used to happen *after* the user had already started talking, putting a DNS
+lookup, a TCP and TLS handshake and a websocket upgrade on the critical path of
+every utterance. A session is now kept warm between turns, so that cost is paid
+during the silence instead. Set `ATHENA_STT_PREWARM=0` to compare, and watch for
+`Speech recognition pre-warm` in the voice log.
+
+Step 3 is the server's sentence-end silence threshold. Set
+`ATHENA_STT_MAX_SENTENCE_SILENCE_MS` to match the local `vad_end_silence_ms` so a
+sentence is not finalised twice, once locally and once remotely.
+
 ## Token efficiency
 
 Text-chat build v0.5 selects tool schemas locally before calling DeepSeek. Ordinary
@@ -222,6 +295,8 @@ List tools with `python -m athena.tools list`. Direct calls accept a JSON file:
 | read_webpage | Fast public HTML/text extraction with source links and retrieval time. |
 | browse_webpage | Headless Chromium for JavaScript pages; read-only, no login, forms, media or downloads. |
 | coding_workspace | Creates projects, writes/reads files, checks syntax, runs Python and unittest tests, and returns real output/errors for the model to fix. |
+| set_alarm / list_alarms / cancel_alarm | Local alarms with no LLM call. Confirms the stored instant, not the words that were heard. |
+| watch_teams_channel / watch_weather | Background alerts for new Teams messages and weather. See "Proactive alerts" above. |
 
 Generated source files persist under `data/coding/<project>/`. This tool does not
 edit ATHENA itself or arbitrary existing projects. Python execution currently

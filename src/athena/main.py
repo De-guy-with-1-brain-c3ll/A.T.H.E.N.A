@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 from athena.audio.capture import Microphone
@@ -10,42 +11,47 @@ from athena.config import Settings, load_local_environment
 from athena.coordinator import VoiceCoordinator
 from athena.llm.deepseek import DeepSeekLanguageModel
 from athena.memory.service import MemoryService
-from athena.stt.fun_asr import FunAsrRecognizer
+from athena.remote_audio import BrowserMicrophone, BrowserSpeaker, RemoteAudio
+from athena.services import build_registry
+from athena.stt import build_recognizer
 from athena.settings.store import RuntimeSettingsStore
-from athena.tools.registry import ToolRegistry
-from athena.tts.qwen import QwenRealtimeSynthesizer
-from athena.voice_ipc import VoiceControlServer
+from athena.tts import build_synthesizer, synthesizer_sample_rate
+from athena.voice_ipc import VoiceAudioServer, VoiceControlServer
 from athena.tools.netease import NetEasePlayer
+
+
+def browser_audio_enabled() -> bool:
+    return os.environ.get("ATHENA_REMOTE_AUDIO", "").strip().casefold() in {"1", "true", "yes", "on"}
 
 
 async def run() -> None:
     load_local_environment()
     settings_store = RuntimeSettingsStore()
     settings = Settings.from_environment(settings_store)
-    speaker = Speaker(settings.tts_sample_rate, device=settings.audio_output_device)
+    # Browser mode keeps the assistant on this machine while the microphone and
+    # speaker come from a device on the local network through the dashboard. The
+    # Pi's own ALSA devices stay closed, so no sound hardware is needed.
+    audio = RemoteAudio() if browser_audio_enabled() else None
+    if audio is not None:
+        speaker = BrowserSpeaker(audio, synthesizer_sample_rate(settings))
+        microphone = BrowserMicrophone(audio)
+    else:
+        speaker = Speaker(synthesizer_sample_rate(settings),
+                          device=settings.audio_output_device)
+        microphone = Microphone(settings.stt_sample_rate, device=settings.audio_input_device)
     netease_player = NetEasePlayer(speaker)
-    tools = ToolRegistry.discover(services={"settings": settings_store, "netease_player": netease_player})
+    tools, alerts = build_registry(settings_store, netease_player=netease_player)
     coordinator = VoiceCoordinator(
-        microphone=Microphone(settings.stt_sample_rate, device=settings.audio_input_device),
+        microphone=microphone,
         speaker=speaker,
-        stt=FunAsrRecognizer(
-            settings.dashscope_api_key,
-            settings.stt_model,
-            settings.stt_sample_rate,
-            settings.stt_language,
-        ),
+        stt=build_recognizer(settings),
         llm=DeepSeekLanguageModel(
             settings.deepseek_api_key,
             settings.deepseek_model,
             tools,
             settings_store,
         ),
-        tts=QwenRealtimeSynthesizer(
-            settings.dashscope_api_key,
-            settings.tts_model,
-            settings.tts_voice,
-            settings=settings_store,
-        ),
+        tts=build_synthesizer(settings, settings_store),
         memory=MemoryService(
             settings.database_path,
             settings.deepseek_api_key,
@@ -61,12 +67,32 @@ async def run() -> None:
         settings_store=settings_store,
         audio_debug=settings.audio_debug,
     )
+    alerts.notify = coordinator.enqueue_external_speech
+    coordinator.alerts = alerts
+    # The sleep tools would otherwise run a consolidation inline, inside a spoken
+    # turn, and time out on work that was going to succeed. With the coordinator
+    # published they hand the job to it and answer immediately.
+    sleep_tool = tools.get("sleep_mode")
+    if sleep_tool is not None:
+        sleep_tool.coordinator = coordinator
+    # The daily Communication Journal schedule. It builds a brief at four and
+    # stays quiet; ATHENA offers it when Benjamin is next there.
+    if os.environ.get("ATHENA_CJ_SCHEDULE", "1").strip().casefold() in {"1", "true", "yes", "on"}:
+        alerts.ensure_watch("cj_schedule", {"at": os.environ.get("ATHENA_CJ_SCHEDULE_AT", "16:00")},
+                            "the Communication Journal schedule", 86_400)
     control = VoiceControlServer(coordinator)
+    audio_bridge = VoiceAudioServer(audio) if audio is not None else None
     try:
         await coordinator.connect()
+        await alerts.start()
         await control.start()
+        if audio_bridge is not None:
+            await audio_bridge.start()
         await coordinator.run()
     finally:
+        if audio_bridge is not None:
+            await audio_bridge.close()
+        await alerts.close()
         await control.close()
         await coordinator.close()
 

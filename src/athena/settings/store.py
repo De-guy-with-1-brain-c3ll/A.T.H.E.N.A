@@ -38,18 +38,50 @@ CATALOG: dict[str, SettingSpec] = {
         live=True,
     ),
     "vad_end_silence_ms": SettingSpec(
-        260,
-        "Silence before ending a command. Lower responds faster but cuts pauses.",
+        # 260 ms ended the turn in the middle of a sentence. A person pauses
+        # 300-700 ms between clauses while thinking, and every one of those
+        # pauses was being read as "finished talking" — which is what "the STT
+        # cut me off" actually was. It is end-of-*speech* detection, not
+        # end-of-sentence, so it has to outlast a breath. 750 ms is where
+        # Benjamin landed after living with 600 and 1200: no more mid-sentence
+        # cut-offs, without the full second of dead air after every command.
+        750,
+        "Silence before ending a command. Raise it if it cuts you off mid-sentence; "
+        "lower it if it feels slow to respond.",
         int,
-        160,
+        200,
+        2000,
+        live=True,
+    ),
+    "vad_start_ms": SettingSpec(
+        100,
+        "Voiced milliseconds needed to start listening. Lower reacts sooner but is more noise-sensitive.",
+        int,
+        40,
+        600,
+        live=True,
+    ),
+    "vad_minimum_speech_ms": SettingSpec(
+        180,
+        "Voiced milliseconds required before a transcript is accepted. Lower accepts shorter words.",
+        int,
+        60,
         1200,
         live=True,
     ),
     "stt_language": SettingSpec(
-        "en", "Recognition language.", str, choices=("en", "zh", "ja", "ko")
+        "en",
+        "Recognition language. 'en,zh' recognises English with Chinese words mixed "
+        "in, which is what misheard CJ as Jesus.",
+        str,
+        choices=("en", "zh", "ja", "ko", "en,zh", "zh,en"),
     ),
     "tts_voice": SettingSpec(
-        "Neil", "Qwen real-time speaking voice.", str, choices=("Neil", "Cherry")
+        "Neil",
+        "Qwen real-time speaking voice. All six cost the same and respond in the "
+        "same ~0.6s, so pick on sound rather than speed.",
+        str,
+        choices=("Neil", "Cherry", "Dolce", "Ethan", "Serena", "Chelsie"),
     ),
     "tts_speech_rate": SettingSpec(
         1.2, "Speaking speed: 1.0 is normal, 1.2 is twenty percent faster.",
@@ -78,21 +110,43 @@ class RuntimeSettingsStore:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or data_directory() / "settings.json"
         self._values: dict[str, Any] = {}
+        self._stamp: tuple[int, int] | None = None
         self.reload()
 
     def reload(self) -> None:
-        if not self.path.is_file():
+        """Re-read settings only when the file actually changed.
+
+        The voice loop reloads settings at the start of every listening turn.
+        Parsing the file each time is wasted work on the critical path, so an
+        unchanged file is skipped entirely.
+        """
+        try:
+            stat = self.path.stat()
+        except OSError:
             self._values = {}
+            self._stamp = None
+            return
+        stamp = (stat.st_mtime_ns, stat.st_size)
+        if stamp == self._stamp:
             return
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError):
             raw = {}
-        self._values = {
-            key: self._validate(key, value)
-            for key, value in raw.items()
-            if key in CATALOG
-        }
+        if not isinstance(raw, dict):
+            raw = {}
+        values: dict[str, Any] = {}
+        for key, value in raw.items():
+            if key not in CATALOG:
+                continue
+            try:
+                values[key] = self._validate(key, value)
+            except (ValueError, TypeError):
+                # One unreadable entry must not stop ATHENA from starting: fall
+                # back to that setting's default and keep the rest.
+                continue
+        self._values = values
+        self._stamp = stamp
 
     def get(self, name: str) -> Any:
         spec = self._spec(name)
@@ -116,6 +170,10 @@ class RuntimeSettingsStore:
                 "value": self.get(name),
                 "default": spec.default,
                 "description": spec.description,
+                "value_type": spec.value_type.__name__,
+                "minimum": spec.minimum,
+                "maximum": spec.maximum,
+                "choices": list(spec.choices),
                 "applies_live": spec.live,
             }
             for name, spec in CATALOG.items()
@@ -129,6 +187,8 @@ class RuntimeSettingsStore:
             encoding="utf-8",
         )
         temporary.replace(self.path)
+        # The file changed, so the cached stamp is stale by definition.
+        self._stamp = None
 
     @staticmethod
     def _spec(name: str) -> SettingSpec:

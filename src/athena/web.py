@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import io
 import ipaddress
+import json
 import os
 from pathlib import Path
 import secrets
@@ -15,7 +16,7 @@ import time
 import wave
 from uuid import UUID
 
-from aiohttp import web
+from aiohttp import WSMsgType, web
 
 from athena.background import BackgroundAgents
 from athena.config import load_local_environment
@@ -24,27 +25,34 @@ from athena.memory.database import MemoryDatabase
 from athena.memory.service import MemoryService
 from athena.paths import database_path
 from athena.prompts import read_prompt, write_prompt
+from athena.remote_audio import FRAME_MS, MICROPHONE_RATE, SPEAKER_RATE
+from athena.services import build_registry
 from athena.settings.store import RuntimeSettingsStore
 from athena.text import TextSession
-from athena.tools.registry import ToolRegistry
 from athena.tts.qwen import QwenRealtimeSynthesizer
-from athena.voice_ipc import request_music, request_speech
+from athena.voice_ipc import (
+    AUDIO_FRAME,
+    FLUSH_FRAME,
+    MAX_FRAME_BYTES,
+    open_audio_stream,
+    pack_frame,
+    read_frame,
+    request_music,
+    request_speech,
+    request_volume,
+)
+from athena.web_auth import COOKIE, SESSION_SECONDS, SessionAuth
 
 
-COOKIE = "athena_session"
-SESSION_SECONDS = 24 * 60 * 60
 STATIC = Path(__file__).resolve().parent / "web_static"
 
 
 class DashboardState:
     def __init__(self) -> None:
         load_local_environment()
-        self.password = os.environ.get("ATHENA_WEB_PASSWORD", "").strip()
-        self.secret = os.environ.get("ATHENA_WEB_SECRET", "").encode()
-        if len(self.password) < 10:
-            raise ValueError("ATHENA_WEB_PASSWORD must contain at least 10 characters.")
-        if len(self.secret) < 32:
-            raise ValueError("ATHENA_WEB_SECRET must contain at least 32 characters.")
+        self.auth = SessionAuth.from_environment()
+        self.password = self.auth.password
+        self.secret = self.auth.secret
         key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
         if not key:
             raise ValueError("DEEPSEEK_API_KEY is missing.")
@@ -52,7 +60,9 @@ class DashboardState:
         self.dashscope_key = os.environ.get("DASHSCOPE_API_KEY", "").strip()
         self.tts_model = os.environ.get("ATHENA_TTS_MODEL", "qwen3-tts-flash-realtime").strip()
         self.speech_lock = asyncio.Lock()
-        registry = ToolRegistry.discover(services={"settings": self.settings})
+        registry, alerts = build_registry(self.settings)
+        self.alerts = alerts
+        self.alerts.notify = self._announce_alarm
         model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash").strip()
         model = DeepSeekLanguageModel(key, model_name, registry, self.settings, interface="text")
         self.memory = MemoryService(
@@ -65,31 +75,35 @@ class DashboardState:
         self.finalize_lock = asyncio.Lock()
         self.login_attempts: dict[str, deque[float]] = defaultdict(deque)
 
+    async def _announce_alarm(self, text: str) -> bool:
+        """Speak an alarm through the voice service when one is running."""
+        print(f"ATHENA alarm: {text}")
+        try:
+            await request_speech(text)
+            return True
+        except Exception:
+            # The dashboard is a separate process; without the voice service the
+            # log line above is the only delivery, which is stated honestly.
+            return False
+
     async def start(self) -> None:
         await self.memory.connect()
+        await self.alerts.start()
 
     async def close(self) -> None:
+        await self.alerts.close()
         await self.background.cancel_all()
         await asyncio.gather(self.session.model.close(), self.memory.close(),
                              return_exceptions=True)
 
     def issue_session(self) -> str:
-        payload = f"{int(time.time())}.{secrets.token_urlsafe(18)}"
-        signature = hmac.new(self.secret, payload.encode(), hashlib.sha256).hexdigest()
-        return f"{payload}.{signature}"
+        return self.auth.issue()
 
     def valid_session(self, token: str) -> bool:
-        try:
-            stamp, nonce, signature = token.split(".", 2)
-            payload = f"{stamp}.{nonce}"
-            expected = hmac.new(self.secret, payload.encode(), hashlib.sha256).hexdigest()
-            age = time.time() - int(stamp)
-            return -60 <= age <= SESSION_SECONDS and hmac.compare_digest(signature, expected)
-        except (ValueError, TypeError):
-            return False
+        return self.auth.valid(token)
 
     def csrf(self, token: str) -> str:
-        return hmac.new(self.secret, ("csrf:" + token).encode(), hashlib.sha256).hexdigest()
+        return self.auth.csrf(token)
 
     def may_try_login(self, address: str) -> bool:
         now = time.monotonic()
@@ -119,6 +133,12 @@ async def local_network_only(request: web.Request, handler):
 
 def _authenticated(request: web.Request) -> bool:
     state: DashboardState = request.app["state"]
+    # A switched-off password means every request is already trusted. The CSRF
+    # check in _require_post still applies, so this is not the same as having no
+    # defences: a page on another site cannot read the token and so cannot drive
+    # the dashboard, which is the case that matters for a browser on this LAN.
+    if state.auth.disabled:
+        return True
     return state.valid_session(request.cookies.get(COOKIE, ""))
 
 
@@ -147,8 +167,18 @@ async def _json_body(request: web.Request) -> dict:
     return body
 
 
-async def index(request: web.Request) -> web.FileResponse:
-    return web.FileResponse(STATIC / "index.html")
+async def index(request: web.Request) -> web.Response:
+    state: DashboardState = request.app["state"]
+    response = web.FileResponse(STATIC / "index.html")
+    # With the password switched off there is no login step to hand out a
+    # session, so the page issues one itself. The session is what the CSRF token
+    # is derived from, so skipping this would leave every write rejected with
+    # "refresh the page" — a dashboard that loads but cannot do anything.
+    if state.auth.disabled and not state.valid_session(request.cookies.get(COOKIE, "")):
+        token = state.issue_session()
+        response.set_cookie(COOKIE, token, max_age=SESSION_SECONDS, httponly=True,
+                            samesite="Strict", path="/")
+    return response
 
 
 async def login(request: web.Request) -> web.Response:
@@ -156,7 +186,7 @@ async def login(request: web.Request) -> web.Response:
     if not state.may_try_login(request.remote or "unknown"):
         raise web.HTTPTooManyRequests(text="Too many attempts. Wait one minute.")
     body = await _json_body(request)
-    if not hmac.compare_digest(str(body.get("password", "")), state.password):
+    if not state.auth.accepts_password(str(body.get("password", ""))):
         await asyncio.sleep(0.35)
         raise web.HTTPUnauthorized(text="Wrong dashboard password.")
     token = state.issue_session()
@@ -240,6 +270,57 @@ async def music_control(request: web.Request) -> web.Response:
         return web.json_response(await request_music(action, value))
     except (RuntimeError, ValueError) as error:
         raise web.HTTPBadRequest(text=str(error)) from None
+
+
+async def volume_status(request: web.Request) -> web.Response:
+    """The speaker level, so the slider opens where it was left."""
+    _require_auth(request)
+    try:
+        return web.json_response(await request_volume())
+    except RuntimeError as error:
+        raise web.HTTPServiceUnavailable(text=str(error)) from None
+
+
+async def volume_control(request: web.Request) -> web.Response:
+    _require_post(request)
+    body = await _json_body(request)
+    value = body.get("value")
+    if value is None:
+        raise web.HTTPBadRequest(text="Volume must be between 0 and 100.")
+    try:
+        return web.json_response(await request_volume(int(value)))
+    except (RuntimeError, ValueError) as error:
+        raise web.HTTPBadRequest(text=str(error)) from None
+
+
+async def settings_status(request: web.Request) -> web.Response:
+    """Every tunable setting, so the dashboard can render editors for them."""
+    state = _require_auth(request)
+    return web.json_response({"settings": state.settings.public_settings()})
+
+
+async def settings_control(request: web.Request) -> web.Response:
+    """Change one setting, or reset it to its default with action="reset"."""
+    state = _require_post(request)
+    body = await _json_body(request)
+    name = str(body.get("name", ""))
+    if not name:
+        raise web.HTTPBadRequest(text="A setting name is required.")
+    try:
+        if body.get("action") == "reset":
+            value, live = state.settings.reset(name)
+        else:
+            if "value" not in body:
+                raise web.HTTPBadRequest(text="A value is required.")
+            value, live = state.settings.set(name, body["value"])
+    except (ValueError, TypeError, OSError) as error:
+        raise web.HTTPBadRequest(text=str(error)) from None
+    return web.json_response({
+        "ok": True,
+        "name": name,
+        "value": value,
+        "applies_live": live,
+    })
 
 
 async def save_prompts(request: web.Request) -> web.Response:
@@ -359,6 +440,71 @@ async def speak_on_device(request: web.Request) -> web.Response:
                         headers={"Cache-Control": "no-store"})
 
 
+async def audio_stream(request: web.Request) -> web.WebSocketResponse:
+    """Relay this browser's microphone and speaker to the voice process.
+
+    The dashboard already refuses non-local addresses and requires a session, so
+    sharing a device's audio needs no extra port, no tunnel and no second login.
+    """
+    _require_auth(request)
+    socket = web.WebSocketResponse(max_msg_size=MAX_FRAME_BYTES, heartbeat=30)
+    await socket.prepare(request)
+    try:
+        reader, writer = await open_audio_stream()
+    except RuntimeError as error:
+        await socket.send_json({"type": "error", "message": str(error)})
+        await socket.close()
+        return socket
+
+    await socket.send_json({"type": "ready", "microphone_rate": MICROPHONE_RATE,
+                            "speaker_rate": SPEAKER_RATE, "frame_ms": FRAME_MS})
+
+    async def from_browser() -> None:
+        async for message in socket:
+            if message.type == WSMsgType.BINARY:
+                writer.write(pack_frame(AUDIO_FRAME, message.data))
+                await writer.drain()
+            elif message.type == WSMsgType.TEXT:
+                try:
+                    control = json.loads(message.data)
+                except ValueError:
+                    continue
+                if isinstance(control, dict) and control.get("type") == "flush":
+                    writer.write(pack_frame(FLUSH_FRAME))
+                    await writer.drain()
+
+    async def to_browser() -> None:
+        while True:
+            frame_type, payload = await read_frame(reader)
+            if frame_type == AUDIO_FRAME:
+                await socket.send_bytes(payload)
+            elif frame_type == FLUSH_FRAME:
+                await socket.send_json({"type": "flush"})
+
+    tasks = [asyncio.create_task(from_browser()), asyncio.create_task(to_browser())]
+    try:
+        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+    except (ConnectionResetError, RuntimeError, ValueError, OSError):
+        pass
+    finally:
+        # Retrieve every task, including the one that finished with the error
+        # that ended the session: awaiting only the pending ones leaves that
+        # exception unretrieved and prints a traceback at shutdown.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+        await socket.close()
+    return socket
+
+
 async def health(_: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
@@ -376,12 +522,17 @@ async def create_app() -> web.Application:
     app.router.add_post("/api/service", service_control)
     app.router.add_get("/api/music", music_status)
     app.router.add_post("/api/music", music_control)
+    app.router.add_get("/api/volume", volume_status)
+    app.router.add_post("/api/volume", volume_control)
     app.router.add_post("/api/prompts", save_prompts)
+    app.router.add_get("/api/settings", settings_status)
+    app.router.add_post("/api/settings", settings_control)
     app.router.add_get("/api/conversations", conversations)
     app.router.add_post("/api/chat", submit_chat)
     app.router.add_get("/api/chat/{identity}", chat_status)
     app.router.add_post("/api/speech/athena", speak_on_athena)
     app.router.add_post("/api/speech/device", speak_on_device)
+    app.router.add_get("/ws/audio", audio_stream)
     app.router.add_get("/health", health)
     app.router.add_static("/static", STATIC, show_index=False)
 

@@ -55,6 +55,29 @@ class FakeModel:
 
 
 class BackgroundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_fragment_is_deliverable_before_the_model_finishes(self):
+        """Voice playback must not wait for the final token of a reply."""
+        release = asyncio.Event()
+
+        class DripModel(FakeModel):
+            async def stream_reply(self, *args, **kwargs):
+                yield "The first sentence. "
+                await release.wait()
+                yield "The second sentence."
+
+        hub = BackgroundAgents(DripModel())
+        job = hub.submit("hello", [])
+        await asyncio.wait_for(hub.changed.wait(), 1)
+        self.assertEqual(hub.next_output(), (job, False))
+        self.assertFalse(job.task.done(), "the job finished before its first fragment was delivered")
+
+        job.delivery_started = True
+        stream = hub.reply_stream(job)
+        self.assertEqual(await anext(stream), "The first sentence. ")
+        release.set()
+        self.assertEqual([part async for part in stream], ["The second sentence."])
+        await job.task
+
     async def test_sequential_chat_reuses_root_and_releases_completed_job(self):
         model = FakeModel()
         hub = BackgroundAgents(model)

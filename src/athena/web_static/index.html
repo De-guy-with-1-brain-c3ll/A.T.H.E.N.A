@@ -32,6 +32,7 @@
       <button class="tab active" data-page="command">Command</button>
       <button class="tab" data-page="history">Conversations</button>
       <button class="tab" data-page="prompts">Prompts</button>
+      <button class="tab" data-page="settings">Settings</button>
       <button id="logout" class="ghost right">Sign out</button>
     </nav>
 
@@ -59,6 +60,11 @@
           <input id="musicVolume" class="volume-slider" type="range" min="0" max="100" step="1" value="35">
           <p id="musicMessage" class="muted music-message">Controls connect directly to the ATHENA speaker.</p>
         </section>
+        <label class="volume-control" for="speakerVolume">
+          <span>Speaker volume</span><output id="speakerVolumeLabel">100%</output>
+        </label>
+        <input id="speakerVolume" class="volume-slider" type="range" min="0" max="100" step="1" value="100" aria-label="ATHENA speaker volume">
+        <p id="volumeMessage" class="muted music-message">Sets how loud ATHENA speaks on the Pi's speaker.</p>
       </article>
       <article class="card chat-card">
         <div class="chat-head"><div><p class="eyebrow">DIRECT LINK</p><h2>Talk to ATHENA</h2></div><span id="taskCount" class="pill">READY</span></div>
@@ -76,6 +82,19 @@
           <textarea id="chatInput" rows="1" maxlength="4000" placeholder="Message ATHENA…" required></textarea>
           <button type="submit" aria-label="Send">Send</button>
         </form>
+      </article>
+      <article class="card">
+        <p class="eyebrow">THIS DEVICE</p>
+        <h2>Microphone and speaker</h2>
+        <p class="muted">Hand ATHENA this device's microphone and speaker instead of the Pi's.
+          Local network only, and the voice service must be running.</p>
+        <div class="control-row">
+          <button id="micStart" type="button">Start</button>
+          <button id="micStop" type="button" class="secondary" disabled>Stop</button>
+        </div>
+        <div class="meter" role="presentation"><span id="micMeter"></span></div>
+        <p id="micStatus" class="muted">Not connected.</p>
+        <p class="muted">Use headphones. Otherwise the microphone hears ATHENA's own voice.</p>
       </article>
     </section>
 
@@ -99,6 +118,15 @@
         <textarea id="memoryPrompt" class="prompt" spellcheck="false"></textarea>
       </article>
       <div class="save-bar"><span id="saveMessage" class="muted"></span><button id="savePrompts">Save prompts</button></div>
+    </section>
+
+    <section id="settings" class="page">
+      <article class="card">
+        <div class="section-head"><div><p class="eyebrow">TUNING</p><h2>Settings</h2></div><button id="refreshSettings" class="secondary">Refresh</button></div>
+        <p class="muted">Changes save to the Pi and apply on the next voice turn unless marked otherwise.</p>
+        <div id="settingsList" class="settings-list"><p class="muted">Loading settings…</p></div>
+        <p id="settingsMessage" class="muted"></p>
+      </article>
     </section>
   </main>
   <script src="/static/app.js"></script>

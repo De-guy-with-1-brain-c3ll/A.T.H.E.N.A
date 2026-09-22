@@ -9,13 +9,14 @@ import sys
 import threading
 from uuid import uuid4
 
+from athena.alerts import AlertScheduler
 from athena.config import load_local_environment
 from athena.background import BackgroundAgents
 from athena.llm.deepseek import DeepSeekLanguageModel, DeepSeekUnavailable
 from athena.memory.service import MemoryService
 from athena.paths import database_path
+from athena.services import build_registry
 from athena.settings.store import RuntimeSettingsStore
-from athena.tools.registry import ToolRegistry
 
 
 class TextSession:
@@ -76,13 +77,13 @@ async def console_input(prompt: str) -> str:
     return await future
 
 
-def _build() -> tuple[TextSession, MemoryService]:
+def _build() -> tuple[TextSession, MemoryService, AlertScheduler]:
     load_local_environment()
     key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not key:
         raise ValueError("Add DEEPSEEK_API_KEY to the project .env file first.")
     settings = RuntimeSettingsStore()
-    registry = ToolRegistry.discover(services={"settings": settings})
+    registry, alerts = build_registry(settings)
     model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash").strip()
     model = DeepSeekLanguageModel(key, model_name, registry, settings, interface="text")
     memory = MemoryService(
@@ -92,12 +93,14 @@ def _build() -> tuple[TextSession, MemoryService]:
         settings.get("memory_batch_delay_seconds"),
         settings,
     )
-    return TextSession(model, memory, registry), memory
+    return TextSession(model, memory, registry), memory, alerts
 
 
 async def run(message: str | None = None) -> int:
-    session, memory = _build()
+    session, memory, alerts = _build()
+    alerts.notify = lambda text: (print(f"\nATHENA: {text}"), True)[1]
     await memory.connect()
+    await alerts.start()
     try:
         if message:
             print("ATHENA: ", end="", flush=True)
@@ -173,6 +176,7 @@ async def run(message: str | None = None) -> int:
             await background.cancel_all()
         return 0
     finally:
+        await alerts.close()
         await asyncio.gather(session.model.close(), memory.close(), return_exceptions=True)
 
 

@@ -9,18 +9,21 @@ from pathlib import Path
 from uuid import uuid4
 
 from athena.config import load_local_environment
+from athena.services import build_registry
 from athena.settings.store import RuntimeSettingsStore
-from athena.tools.registry import ToolRegistry
 
 
 async def run(args) -> int:
     load_local_environment()
     settings = RuntimeSettingsStore()
-    registry = ToolRegistry.discover(services={"settings": settings})
+    registry, alerts = build_registry(settings)
+    alerts.notify = lambda text: (print(f"\nATHENA: {text}"), True)[1]
     if args.action == "list":
         print(json.dumps(registry.definitions(), indent=2, ensure_ascii=False))
         return 0
     if args.action == "call":
+        # A one-shot call cannot wait for the alarm, but the alarm is still
+        # stored so a running interface can fire it.
         raw = Path(args.arguments_file).read_text(encoding="utf-8") if args.arguments_file else args.arguments
         result = await registry.execute(args.name, json.loads(raw))
         print(json.dumps(asdict(result), indent=2, ensure_ascii=False))
@@ -32,6 +35,7 @@ async def run(args) -> int:
     llm = DeepSeekLanguageModel(key, os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"), registry, settings)
     history = []
     print("ATHENA tools chat. Type exit to stop. Coding is restricted to data/coding.")
+    await alerts.start()
     try:
         while not registry.shutdown_requested:
             text = await asyncio.to_thread(input, "You: ")
@@ -48,6 +52,7 @@ async def run(args) -> int:
             history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": "".join(parts)}])
         return 0
     finally:
+        await alerts.close()
         await llm.close()
 
 
