@@ -41,11 +41,15 @@ class _Settings:
 
 
 class SettingsTests(unittest.TestCase):
-    def test_the_voice_defaults_to_aria(self):
+    def test_the_voice_defaults_to_a_warm_one(self):
+        # The default used to be Aria, chosen on speed alone. It is tagged only
+        # "Positive, Confident" and reads flat, which is heard as coldness. Jenny
+        # is tagged "Friendly, Considerate, Comfort" and measured the same speed
+        # to first audio, so the warmth costs nothing.
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ATHENA_EDGE_VOICE", None)
             self.assertEqual(edge_voice(), DEFAULT_VOICE)
-            self.assertEqual(DEFAULT_VOICE, "en-US-AriaNeural")
+            self.assertEqual(DEFAULT_VOICE, "en-US-JennyNeural")
 
     def test_a_configured_voice_wins(self):
         with patch.dict(os.environ, {"ATHENA_EDGE_VOICE": "en-GB-RyanNeural"}):

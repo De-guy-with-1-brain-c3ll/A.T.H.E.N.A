@@ -387,6 +387,31 @@ class SenseVoiceRecognizer:
         self._recognizer.decode_stream(stream)
         return strip_tags(stream.result.text)
 
+    async def transcribe_once(self, pcm: bytes) -> str:
+        """Decode one completed utterance for the local wake gate.
+
+        This path never opens a cloud socket and never publishes a normal STT
+        turn. It is intentionally one decode after local VAD closes, rather
+        than continuous partial decoding, so background speech costs CPU only
+        while somebody is actually speaking.
+        """
+        if self._recognizer is None or not pcm:
+            return ""
+        buffer = _TurnBuffer(self._sample_rate)
+        buffer.append(pcm)
+        if buffer.seconds < MINIMUM_DECODE_SECONDS:
+            return ""
+        try:
+            async with asyncio.timeout(DECODE_TIMEOUT_SECONDS):
+                return await asyncio.to_thread(self._transcribe, buffer.samples())
+        except TimeoutError:
+            print("Local wake detection took too long; ignoring that utterance.", flush=True)
+            return ""
+        except Exception as error:
+            print(f"Local wake detection failed ({type(error).__name__}); ignoring utterance.",
+                  flush=True)
+            return ""
+
     def _publish_text(self, turn: UUID, text: str, final: bool) -> str:
         if final:
             self._publish(Transcript(turn, text or "", True, None))

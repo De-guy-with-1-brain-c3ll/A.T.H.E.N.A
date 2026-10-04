@@ -89,6 +89,12 @@ class Settings:
     # fresh installs use the requested voice even before runtime settings exist.
     tts_voice: str = "Dolce"
     deepseek_model: str = "deepseek-v4-flash"
+    # Voice can use a faster provider independently of the full DeepSeek
+    # agent.  Memory, text chat, and tools deliberately retain DeepSeek: they
+    # depend on its existing tool-call behaviour and do not sit on the spoken
+    # first-audio path.
+    voice_llm_provider: str = "deepseek"
+    voice_llm_model: str = "deepseek-v4-flash"
     stt_sample_rate: int = 16_000
     tts_sample_rate: int = 24_000
     # Keep a DashScope speech session warm between turns so the websocket
@@ -96,7 +102,10 @@ class Settings:
     stt_prewarm: bool = True
     # Ask the service to finalise a sentence as soon as the local gate does.
     # None leaves the service default in place.
-    stt_max_sentence_silence_ms: int | None = 1200
+    # Let the streaming service finalise when the local gate has closed the
+    # input.  Live paced testing found that overriding this can delay the final
+    # transcript by seconds, even when it matches the VAD window.
+    stt_max_sentence_silence_ms: int | None = None
     # Semantic punctuation makes the service ignore pauses when deciding where
     # a sentence ends, so finals arrive late and one utterance gets answered in
     # pieces — the "replies to the previous turn" complaint. Off by default:
@@ -122,6 +131,16 @@ class Settings:
     vad_noise_multiplier: float = 2.7
     vad_end_silence_ms: int = 750
 
+    @property
+    def voice_llm_api_key(self) -> str:
+        return self.dashscope_api_key if self.voice_llm_provider == "qwen" else self.deepseek_api_key
+
+    @property
+    def voice_llm_base_url(self) -> str:
+        if self.voice_llm_provider == "qwen":
+            return "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        return "https://api.deepseek.com"
+
     @classmethod
     def from_environment(
         cls, runtime: RuntimeSettingsStore | None = None
@@ -140,6 +159,14 @@ class Settings:
         if missing:
             raise ValueError("Missing environment variable(s): " + ", ".join(missing))
         resolved_database_path = database_path()
+        voice_provider = os.environ.get("ATHENA_VOICE_LLM_PROVIDER", "deepseek").strip().casefold()
+        if voice_provider not in {"deepseek", "qwen"}:
+            raise ValueError("ATHENA_VOICE_LLM_PROVIDER must be 'deepseek' or 'qwen'.")
+        deepseek_model = (
+            os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash").strip()
+            or "deepseek-v4-flash"
+        )
+        voice_default_model = "qwen-turbo" if voice_provider == "qwen" else deepseek_model
         return cls(
             dashscope_api_key=dashscope_key,
             deepseek_api_key=deepseek_key,
@@ -152,9 +179,11 @@ class Settings:
                 os.environ.get("ATHENA_TTS_MODEL", "qwen3-tts-flash-realtime").strip()
                 or "qwen3-tts-flash-realtime"
             ),
-            deepseek_model=(
-                os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash").strip()
-                or "deepseek-v4-flash"
+            deepseek_model=deepseek_model,
+            voice_llm_provider=voice_provider,
+            voice_llm_model=(
+                os.environ.get("ATHENA_VOICE_LLM_MODEL", voice_default_model).strip()
+                or voice_default_model
             ),
             audio_input_device=os.environ.get("ATHENA_AUDIO_INPUT_DEVICE", "").strip() or None,
             audio_output_device=os.environ.get("ATHENA_AUDIO_OUTPUT_DEVICE", "").strip() or None,
@@ -168,7 +197,7 @@ class Settings:
             stt_prewarm=os.environ.get("ATHENA_STT_PREWARM", "1").strip().casefold()
             in {"1", "true", "yes", "on"},
             stt_max_sentence_silence_ms=(
-                int(os.environ.get("ATHENA_STT_MAX_SENTENCE_SILENCE_MS", "1200")) or None
+                int(os.environ.get("ATHENA_STT_MAX_SENTENCE_SILENCE_MS", "0")) or None
             ),
             stt_semantic_punctuation=os.environ.get(
                 "ATHENA_STT_SEMANTIC_PUNCTUATION", "0").strip().casefold()

@@ -194,18 +194,28 @@ class TeamsGraph:
         self.auth = auth or TeamsAuth()
         self._session: aiohttp.ClientSession | None = None
         self._tokens: dict[tuple[str, ...], tuple[str, float]] = {}
+        self._token_lock = asyncio.Lock()
         self._teams: list[dict[str, Any]] = []
         self._teams_at = 0.0
         self._channels: dict[str, tuple[list[dict[str, Any]], float]] = {}
 
-    def _access_token(self, scopes: list[str] | None = None) -> str:
+    async def _access_token(self, scopes: list[str] | None = None) -> str:
         key = tuple(scopes or self.auth.scopes)
         cached = self._tokens.get(key)
         if cached and cached[1] > time.monotonic():
             return cached[0]
-        token = self.auth.token(scopes)
-        self._tokens[key] = (token, time.monotonic() + TOKEN_REUSE_SECONDS)
-        return token
+        async with self._token_lock:
+            cached = self._tokens.get(key)
+            if cached and cached[1] > time.monotonic():
+                return cached[0]
+            refresh = asyncio.create_task(asyncio.to_thread(self.auth.token, scopes))
+            try:
+                token = await asyncio.shield(refresh)
+            except asyncio.CancelledError:
+                await asyncio.gather(refresh, return_exceptions=True)
+                raise
+            self._tokens[key] = (token, time.monotonic() + TOKEN_REUSE_SECONDS)
+            return token
 
     async def _client(self) -> aiohttp.ClientSession:
         """One connection pool for the whole process, so TLS is paid once."""
@@ -223,7 +233,7 @@ class TeamsGraph:
 
     async def get_bytes(self, path: str) -> bytes:
         session = await self._client()
-        headers = {"Authorization": f"Bearer {self._access_token()}"}
+        headers = {"Authorization": f"Bearer {await self._access_token()}"}
         async with session.get(GRAPH + path, headers=headers) as response:
             if response.status >= 400:
                 if response.status in {401, 403}:
@@ -266,7 +276,7 @@ class TeamsGraph:
 
     async def get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
         session = await self._client()
-        headers = {"Authorization": f"Bearer {self._access_token()}"}
+        headers = {"Authorization": f"Bearer {await self._access_token()}"}
         async with session.get(GRAPH + path, params=params, headers=headers) as response:
             body = await response.text()
             if response.status >= 400:
@@ -309,7 +319,7 @@ class TeamsGraph:
             "$select": "id,displayName,dueDateTime,status,classId,assignDateTime,closeDateTime",
         }
         session = await self._client()
-        headers = {"Authorization": f"Bearer {self._access_token(ASSIGNMENT_SCOPES)}"}
+        headers = {"Authorization": f"Bearer {await self._access_token(ASSIGNMENT_SCOPES)}"}
         pages = 0
         while url and pages < 20:
             pages += 1
@@ -624,18 +634,23 @@ async def diagnose() -> int:
         ("assignments", "EduAssignments.Read", assignments),
         ("channel messages", "ChannelMessage.Read.All", posts),
     ]
-    for label, permission, call in checks:
-        try:
-            summary = await call()
-        except _Skipped as reason:
-            skipped += 1
-            print(f"  skip  {label}  ({reason})")
-        except Exception as error:
-            failures += 1
-            print(f"  FAIL  {label}  (needs {permission})")
-            print(f"        {error}")
-        else:
-            print(f"  ok    {label}  ->  {summary}")
+    try:
+        for label, permission, call in checks:
+            try:
+                summary = await call()
+            except _Skipped as reason:
+                skipped += 1
+                print(f"  skip  {label}  ({reason})")
+            except Exception as error:
+                failures += 1
+                print(f"  FAIL  {label}  (needs {permission})")
+                print(f"        {error}")
+            else:
+                print(f"  ok    {label}  ->  {summary}")
+    finally:
+        closer = getattr(graph, "close", None)
+        if closer:
+            await closer()
 
     print()
     if failures:

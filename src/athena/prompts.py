@@ -7,7 +7,25 @@ from pathlib import Path
 from athena.paths import data_directory
 
 
-_LIMITS = {"system": 20_000, "memory": 10_000}
+_LIMITS = {"system": 20_000, "memory": 10_000, "voice": 20_000}
+
+
+def interaction_style() -> str:
+    """Compact policy distilled from the approved, packaged 30-case reference."""
+    return (Path(__file__).resolve().parent / "system" / "interaction_style.txt").read_text(encoding="utf-8").strip()
+
+
+def interaction_examples() -> list[dict]:
+    """Evaluation/reference examples; never inject fictional state into live chat."""
+    import json
+    return json.loads((Path(__file__).resolve().parent / "system" / "interaction_examples.json").read_text(encoding="utf-8"))
+
+
+def read_voice_prompt() -> str:
+    """Use the compact default without replacing a customized system prompt."""
+    system = read_prompt("system")
+    default = packaged_prompt_path("system").read_text(encoding="utf-8").strip()
+    return read_prompt("voice") if system == default else system
 
 
 def packaged_prompt_path(name: str) -> Path:

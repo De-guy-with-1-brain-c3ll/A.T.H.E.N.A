@@ -97,16 +97,42 @@ class LLMToolTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await model.close()
 
-    async def test_yes_without_host_approval_never_reaches_model(self):
+    async def test_conversational_yes_reaches_model_without_granting_host_approval(self):
         with tempfile.TemporaryDirectory() as directory:
             registry = ToolRegistry()
             model = DeepSeekLanguageModel('test', 'test', registry,
                 RuntimeSettingsStore(Path(directory) / 'settings.json'))
-            model._client.chat.completions.create = AsyncMock()
+            model._client.chat.completions.create = AsyncMock(return_value=Stream([chunk('Continuing your request.')]))
             try:
                 answer = ''.join([part async for part in model.stream_reply(uuid4(), 'yes')])
-                self.assertIn('no real action', answer.casefold())
-                model._client.chat.completions.create.assert_not_awaited()
+                self.assertEqual('Continuing your request.', answer)
+                model._client.chat.completions.create.assert_awaited_once()
+                self.assertFalse(registry.has_pending_approval)
+            finally:
+                await model.close()
+
+    async def test_routine_workspace_question_is_repaired_into_real_tools(self):
+        from athena.tools.coding import CodingWorkspaceTool
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ToolRegistry()
+            coding = CodingWorkspaceTool(root=Path(directory)/"coding")
+            registry.register(coding)
+            model = DeepSeekLanguageModel('test', 'test', registry,
+                RuntimeSettingsStore(Path(directory)/'settings.json'))
+            create = NS(index=0, id='create-project', function=NS(name='coding_workspace',
+                arguments=json.dumps({'action': 'create', 'project': 'hello'})))
+            write = NS(index=0, id='write-file', function=NS(name='coding_workspace',
+                arguments=json.dumps({'action': 'write', 'project': 'hello', 'path': 'main.py',
+                                      'content': 'print("Hello world")'})))
+            model._client.chat.completions.create = AsyncMock(side_effect=[
+                Stream([chunk('Should I proceed with creating the project?')]),
+                Stream([chunk(calls=[create])]), Stream([chunk(calls=[write])]),
+                Stream([chunk('Created the Hello World file.')])])
+            try:
+                answer = ''.join([part async for part in model.stream_reply(uuid4(), 'write a hello world Python file')])
+                self.assertNotIn('Should I', answer)
+                self.assertTrue((Path(directory)/'coding'/'hello'/'main.py').exists())
+                self.assertFalse(registry.has_pending_approval)
             finally:
                 await model.close()
 

@@ -27,8 +27,10 @@ VENV_BUILD_TIMEOUT_SECONDS = 600
 
 
 def signing_payload(manifest: dict) -> bytes:
-    return (f"{manifest['schema']}\n{manifest['version']}\n{manifest['archive']}\n"
-            f"{manifest['sha256']}\n{manifest['bytes']}\n").encode()
+    # The sequence is part of the signature, so an old but validly signed
+    # manifest cannot be replayed to roll the Pi back to a weaker build.
+    return (f"{manifest['schema']}\n{manifest['sequence']}\n{manifest['version']}\n"
+            f"{manifest['archive']}\n{manifest['sha256']}\n{manifest['bytes']}\n").encode()
 
 
 def fetch(url: str, maximum: int) -> bytes:
@@ -47,11 +49,14 @@ def fetch(url: str, maximum: int) -> bytes:
 
 
 def verify_release(manifest: dict, bundle: bytes, key: bytes) -> None:
-    required = {"schema", "version", "archive", "sha256", "bytes", "signature"}
+    required = {"schema", "version", "archive", "sha256", "bytes", "signature", "sequence"}
     if not isinstance(manifest, dict) or not required.issubset(manifest):
         raise ValueError("The update manifest is incomplete.")
     if manifest["schema"] != 1 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", str(manifest["version"])):
         raise ValueError("The update manifest has an unsupported version format.")
+    sequence = manifest["sequence"]
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+        raise ValueError("The update manifest has an invalid release sequence.")
     if not re.fullmatch(r"athena-[A-Za-z0-9._-]+\.zip", str(manifest["archive"])):
         raise ValueError("The update archive name is invalid.")
     if len(key) < 32:
@@ -84,8 +89,18 @@ def extract_bundle(bundle: bytes, destination: Path) -> None:
             target = destination.joinpath(*name.parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             if not member.is_dir():
+                # Never trust the declared size alone: a zip bomb declares a
+                # small file_size and then inflates far beyond it.
                 with archive.open(member) as source, target.open("wb") as output:
-                    shutil.copyfileobj(source, output, 1024 * 1024)
+                    remaining = member.file_size
+                    while remaining > 0:
+                        chunk = source.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        remaining -= len(chunk)
+                    if remaining > 0 or source.read(1):
+                        raise ValueError("The update archive contains a corrupted or inflated file.")
     if not (destination / "pyproject.toml").is_file() or not (destination / "src" / "athena" / "__init__.py").is_file():
         raise ValueError("The update is missing ATHENA program files.")
 
@@ -195,6 +210,7 @@ def install_release(root: Path, manifest: dict, bundle: bytes, service: str) -> 
         subprocess.run([str(python), "-c", smoke],
                        cwd=release, check=True, timeout=60)
         previous = switch_link(root / "current", release)
+        record_state(root, manifest)
         try:
             restart_service(service)
             restart_dashboard()
@@ -221,12 +237,36 @@ def current_version(root: Path) -> str:
     return version_file.read_text(encoding="utf-8").strip() if version_file.is_file() else ""
 
 
+def installed_state(root: Path) -> dict:
+    """Last installed release, used to refuse downgrades and replays."""
+    path = root / "state.json"
+    if path.is_file():
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(state, dict):
+                return state
+        except (OSError, ValueError):
+            pass
+    return {"version": current_version(root), "sequence": 0}
+
+
+def record_state(root: Path, manifest: dict) -> None:
+    path = root / "state.json"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"version": str(manifest["version"]),
+                                     "sequence": int(manifest["sequence"])},
+                                    indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default=os.environ.get("ATHENA_UPDATE_URL", ""))
     parser.add_argument("--root", type=Path, default=Path("/opt/athena"))
     parser.add_argument("--service", default=os.environ.get("ATHENA_UPDATE_SERVICE", "athena-feishu.service"))
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--force", action="store_true",
+                        help="Install even if the release is not newer than the installed one.")
     args = parser.parse_args()
     if not args.url:
         raise ValueError("Set ATHENA_UPDATE_URL to your computer's update-feed address.")
@@ -249,6 +289,16 @@ def main() -> int:
             raise ValueError("ATHENA_UPDATE_KEY must contain at least 32 characters.")
         bundle = fetch(urljoin(args.url.rstrip("/") + "/", archive), MAX_BUNDLE_BYTES)
         verify_release(manifest, bundle, key)
+        # Checked only after the signature: an unauthenticated sequence is
+        # just an attacker-controlled number.
+        state = installed_state(root)
+        installed_sequence = int(state.get("sequence", 0) or 0)
+        if not args.force and int(manifest["sequence"]) <= installed_sequence:
+            raise ValueError(
+                f"The feed offers release {version or '?'} with sequence "
+                f"{manifest['sequence']}, which is not newer than the installed "
+                f"sequence {installed_sequence}. Refusing to downgrade or replay "
+                "an older signed release; pass --force only if you are certain.")
         install_release(root, manifest, bundle, args.service)
         print(f"ATHENA {version} installed and {args.service} restarted.")
     return 0

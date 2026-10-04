@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/python3 /usr/local/lib/athena-vpn/vpn_control.py "$@"

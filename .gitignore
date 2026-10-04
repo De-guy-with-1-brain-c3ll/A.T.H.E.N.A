@@ -30,3 +30,17 @@ outputs/
 .workbuddy-ai/
 # The Pi's current LAN address; it changes with DHCP.
 orange_pi/pi-address.txt
+ATHENA Inbox/
+orange_pi/.pc-transfer-key
+orange_pi/.pc-inbox-process.json
+ATHENA VPN.spec
+ATHENA Control.spec
+# Local editor memory, caches, generated packaging and video capture artifacts.
+.workbuddy/
+.pytest_cache/
+*.spec
+motion/_bp/
+motion/_rec_tmp/
+motion/_verify/
+motion/*.log
+motion/*.txt

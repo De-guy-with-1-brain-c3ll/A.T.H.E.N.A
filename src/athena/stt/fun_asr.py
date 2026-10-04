@@ -246,6 +246,7 @@ class FunAsrRecognizer:
             # it goes to a worker thread. Frames are still sent in order because
             # each call is awaited before the next one starts.
             await asyncio.to_thread(recognition.send_audio_frame, pcm)
+            self._meter_bytes = getattr(self, '_meter_bytes', 0) + len(pcm)
         except Exception as error:
             if "stopped" not in str(error).casefold():
                 raise
@@ -262,6 +263,7 @@ class FunAsrRecognizer:
             try:
                 await self._open(turn_id)
                 await asyncio.to_thread(self._recognition.send_audio_frame, pcm)
+                self._meter_bytes = getattr(self, '_meter_bytes', 0) + len(pcm)
             except Exception:
                 self._recognition = None
                 self._publish(Transcript(turn_id, "[STT error] connection closed", True, 0.0))
@@ -271,6 +273,14 @@ class FunAsrRecognizer:
             yield await self._results.get()
 
     async def _finish_turn(self, *, prewarm: bool) -> None:
+        sent = getattr(self, '_meter_bytes', 0)
+        self._meter_bytes = 0
+        if sent:
+            from athena.metrics import record
+            await asyncio.to_thread(record, 'qwen_stt', {
+                'audio_seconds': sent / (self._sample_rate * 2),
+                'audio_bytes': sent,
+                'token_estimate': 'unavailable: audio duration is measured, not text tokens'})
         recognition, self._recognition = self._recognition, None
         self._callback = None
         self._prewarmed = False
@@ -297,7 +307,10 @@ class FunAsrRecognizer:
         # handshake is off the critical path of the following utterance.
         if prewarm and self._prewarm_enabled and self._prewarm_task is None:
             self._prewarm_task = asyncio.create_task(self._prewarm())
-            self._prewarm_task.add_done_callback(lambda _task: setattr(self, "_prewarm_task", None))
+            def finished(task):
+                if self._prewarm_task is task:
+                    self._prewarm_task = None
+            self._prewarm_task.add_done_callback(finished)
 
     async def finish_turn(self) -> None:
         await self._finish_turn(prewarm=True)

@@ -45,7 +45,8 @@ class WeatherTool:
                 label = location
             else:
                 geo = await self.http.json("https://geocoding-api.open-meteo.com/v1/search?" + urlencode({
-                    "name": location, "count": 5, "language": "en", "format": "json"}))
+                    "name": location.split(",", 1)[0].strip(), "count": 5,
+                    "language": "en", "format": "json"}))
                 matches = geo.get("results", [])
                 if not matches:
                     return ToolResult(False, "Location not found. Try a city and country, or coordinates.")

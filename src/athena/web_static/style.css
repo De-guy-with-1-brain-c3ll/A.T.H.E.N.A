@@ -8,3 +8,17 @@
 .setting-controls{display:flex;gap:8px;align-items:center;margin:0}
 .setting-controls input,.setting-controls select{max-width:220px;width:auto;padding:9px 12px}
 .setting-controls button{padding:9px 14px}
+/* Detected speech */
+.speech-panel{margin-top:14px;border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:#08121880}
+.speech-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+.speech-heard{margin:0;min-height:1.45em;color:var(--muted);font-style:italic;word-break:break-word}
+.speech-heard.live{color:var(--cyan);font-style:normal}
+.speech-final{margin:6px 0 0;color:var(--text);font-weight:600;word-break:break-word}
+.speech-loss{color:var(--red);font-weight:650}
+.speech-waiting{border-color:#34515c;color:var(--muted)}
+.speech-listening{border-color:var(--cyan);color:var(--cyan)}
+.speech-speech{border-color:#7dffb0;color:#7dffb0}
+.speech-ended{border-color:#ffd166;color:#ffd166}
+.speech-stale{border-color:#843b46;color:var(--red)}
+.restart-all-row{margin-top:4px;align-items:center;gap:12px}
+.restart-all-hint{font-size:12px}

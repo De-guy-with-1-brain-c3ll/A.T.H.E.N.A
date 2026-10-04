@@ -290,7 +290,11 @@ async def recognise(model: str, pcm: bytes, languages: list[str]) -> dict:
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--models", nargs="*", default=list(ASR_MODELS))
-    parser.add_argument("--sentences", nargs="*", default=list(SENTENCES))
+    parser.add_argument(
+        "--sentences", nargs="*", choices=tuple(SENTENCES),
+        default=list(SENTENCES),
+        help="controlled sentence ids to synthesize and recognise",
+    )
     parser.add_argument("--out", default="outputs/audio-tests")
     args = parser.parse_args()
 

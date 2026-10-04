@@ -37,8 +37,29 @@ class ClockMessageTests(unittest.TestCase):
         now = datetime.now().astimezone()
         self.assertIn(now.strftime("%A"), message["content"])
         self.assertIn(now.strftime("%d %B %Y"), message["content"])
-        self.assertRegex(message["content"], r"at \d{2}:\d{2}")
         self.assertIn("ground truth", message["content"])
+
+    def test_the_clock_is_written_the_way_it_is_spoken(self):
+        # This line is read aloud, and the model copies it verbatim when asked
+        # the time. A bare %H:%M here came out as a bare "20:27" out loud, which
+        # is the one thing you cannot say to someone who asked you the time.
+        message = clock_message()["content"]
+        self.assertRegex(message, r"at \d{1,2}:\d{2} [AP]M")
+        self.assertNotRegex(message, r"at \d{2}:\d{2}\b(?! [AP]M)",
+                            "no 24-hour clock survives anywhere in this line")
+
+    def test_the_clock_says_which_part_of_the_day_it_is(self):
+        # "8:27" alone is ambiguous out loud; the part of day disambiguates it.
+        message = clock_message()["content"]
+        self.assertTrue(
+            any(part in message for part in
+                ("in the morning", "in the afternoon", "in the evening")),
+            "the clock must name the part of the day")
+
+    def test_the_model_is_told_to_say_the_time_in_twelve_hour_form(self):
+        message = clock_message()["content"]
+        self.assertIn("12-hour", message)
+        self.assertIn("never as 24-hour", message)
 
     def test_two_calls_are_built_independently(self):
         # The point of the function: nothing is cached, so a request made days

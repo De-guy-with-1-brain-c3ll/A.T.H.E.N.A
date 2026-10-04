@@ -12,34 +12,40 @@ import json
 import os
 from pathlib import Path
 import secrets
+import ssl
 import time
 import wave
 from uuid import UUID
 
 from aiohttp import WSMsgType, web
 
+from athena.audio.telemetry import DEFAULT_STATUS_PATH, read_status
 from athena.background import BackgroundAgents
 from athena.config import load_local_environment
 from athena.llm.deepseek import DeepSeekLanguageModel
 from athena.memory.database import MemoryDatabase
 from athena.memory.service import MemoryService
 from athena.paths import database_path
+from athena.metrics import snapshot, read_progress
 from athena.prompts import read_prompt, write_prompt
-from athena.remote_audio import FRAME_MS, MICROPHONE_RATE, SPEAKER_RATE
+from athena.remote_audio import FRAME_MS, MICROPHONE_RATE, SPEAKER_CHANNELS, SPEAKER_RATE
 from athena.services import build_registry
 from athena.settings.store import RuntimeSettingsStore
 from athena.text import TextSession
 from athena.tts.qwen import QwenRealtimeSynthesizer
 from athena.voice_ipc import (
     AUDIO_FRAME,
+    CONTROL_FRAME,
     FLUSH_FRAME,
     MAX_FRAME_BYTES,
+    MUSIC_COMMANDS,
     open_audio_stream,
     pack_frame,
     read_frame,
     request_music,
     request_speech,
     request_volume,
+    request_audio_route,
 )
 from athena.web_auth import COOKIE, SESSION_SECONDS, SessionAuth
 
@@ -124,6 +130,35 @@ def _is_local(remote: str | None) -> bool:
         return False
 
 
+TLS_CERT_ENV = "ATHENA_WEB_TLS_CERT"
+TLS_KEY_ENV = "ATHENA_WEB_TLS_KEY"
+
+
+def tls_context(cert: str = "", key: str = "") -> ssl.SSLContext | None:
+    """Build the dashboard's TLS context, or ``None`` to serve plain HTTP.
+
+    Browsers only expose the microphone in a "secure context", and a plain
+    ``http://`` address on the local network is not one — so a device on the LAN
+    cannot hand ATHENA its microphone, and music fails with it because the
+    speaker attaches over the same socket. Serving the dashboard over TLS is what
+    makes browser audio work from another machine; localhost would need no
+    certificate at all, which is why this only bites on a LAN address.
+
+    The two paths are required together. Half a key pair is always a mistake, and
+    quietly falling back to HTTP would put the microphone back behind a "secure
+    context" error that says nothing about the cause.
+    """
+    if not cert and not key:
+        return None
+    if not cert or not key:
+        raise ValueError(f"{TLS_CERT_ENV} and {TLS_KEY_ENV} must be set together.")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    # Below 1.2 the browsers this is used from have already refused the handshake.
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(cert, key)
+    return context
+
+
 @web.middleware
 async def local_network_only(request: web.Request, handler):
     if not _is_local(request.remote):
@@ -203,21 +238,59 @@ async def logout(request: web.Request) -> web.Response:
     return response
 
 
-async def _service_action(action: str | None = None) -> tuple[str, str]:
-    if action:
-        process = await asyncio.create_subprocess_exec(
-            "sudo", "-n", "/usr/bin/systemctl", action, "athena-voice.service",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        _, error = await asyncio.wait_for(process.communicate(), 20)
-        if process.returncode:
-            raise RuntimeError(error.decode(errors="replace").strip() or "Service control failed.")
+VOICE_SERVICE = "athena-voice.service"
+WEB_SERVICE = "athena-web.service"
+SERVICE_TIMEOUT = 20
+WEB_RESTART_DELAY = 1.5
+
+
+async def _systemctl(*arguments: str, timeout: float = SERVICE_TIMEOUT) -> str:
+    """Run one privileged systemctl argument list, returning nothing useful."""
     process = await asyncio.create_subprocess_exec(
-        "/usr/bin/systemctl", "is-active", "athena-voice.service",
+        "sudo", "-n", "/usr/bin/systemctl", *arguments,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    _, error = await asyncio.wait_for(process.communicate(), timeout)
+    if process.returncode:
+        raise RuntimeError(error.decode(errors="replace").strip() or "Service control failed.")
+    return error.decode(errors="replace")
+
+
+async def _service_status(service: str = VOICE_SERVICE) -> str:
+    process = await asyncio.create_subprocess_exec(
+        "/usr/bin/systemctl", "is-active", service,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
     )
     output, _ = await process.communicate()
-    status = output.decode().strip() or "unknown"
+    return output.decode().strip() or "unknown"
+
+
+async def _schedule_web_restart() -> None:
+    """Restart the dashboard after this response has been flushed.
+
+    athena-web cannot survive the request that restarts it, so the restart is
+    detached behind a short delay. ``--no-block`` returns immediately instead of
+    waiting on the unit, which would otherwise stall this coroutine until the
+    very process it belongs to is killed.
+    """
+    await asyncio.sleep(WEB_RESTART_DELAY)
+    await asyncio.create_subprocess_exec(
+        "sudo", "-n", "/usr/bin/systemctl", "restart", "--no-block", WEB_SERVICE,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+
+
+async def _service_action(action: str | None = None, everything: bool = False) -> tuple[str, str]:
+    if action:
+        if everything:
+            await _systemctl(action, VOICE_SERVICE)
+            await _systemctl(action, 'athena-feishu.service')
+            asyncio.create_task(_schedule_web_restart())
+            return await _service_status(VOICE_SERVICE), (
+                "ATHENA is restarting. The dashboard will reconnect in a few seconds."
+            )
+        await _systemctl(action, VOICE_SERVICE)
+    status = await _service_status(VOICE_SERVICE)
     return status, "ATHENA voice is running." if status == "active" else "ATHENA voice is stopped."
 
 
@@ -241,13 +314,16 @@ async def service_control(request: web.Request) -> web.Response:
     _require_post(request)
     body = await _json_body(request)
     action = str(body.get("action", ""))
-    if action not in {"start", "stop", "restart"}:
+    if action not in {"start", "stop", "restart", "restart_all"}:
         raise web.HTTPBadRequest(text="Unknown service action.")
+    everything = action == "restart_all"
     try:
-        status, label = await _service_action(action)
+        status, label = await _service_action("restart" if everything else action, everything)
     except (RuntimeError, asyncio.TimeoutError) as error:
         raise web.HTTPInternalServerError(text=str(error)) from None
-    return web.json_response({"service": status, "serviceLabel": label})
+    return web.json_response({
+        "service": status, "serviceLabel": label, "restartedAll": everything,
+    })
 
 
 async def music_status(request: web.Request) -> web.Response:
@@ -262,14 +338,47 @@ async def music_control(request: web.Request) -> web.Response:
     _require_post(request)
     body = await _json_body(request)
     action = str(body.get("action", ""))
-    if action not in {"toggle", "pause", "resume", "next", "stop", "volume"}:
+    if action not in MUSIC_COMMANDS:
         raise web.HTTPBadRequest(text="Unknown music action.")
     value = body.get("value")
+    name = body.get("name")
+    moods = body.get("moods")
+    if moods is not None and not isinstance(moods, list):
+        raise web.HTTPBadRequest(text="Playlist moods must be a list of short tags.")
     try:
         value = int(value) if value is not None else None
-        return web.json_response(await request_music(action, value))
+        return web.json_response(await request_music(
+            action, value,
+            name=str(name) if name is not None else None,
+            query=str(body.get("query", "")),
+            moods=[str(mood) for mood in moods] if moods else None))
     except (RuntimeError, ValueError) as error:
         raise web.HTTPBadRequest(text=str(error)) from None
+
+
+STALE_SECONDS = 2.0
+
+
+def speech_status_path() -> Path:
+    configured = os.environ.get("ATHENA_AUDIO_STATUS_PATH", "").strip()
+    return Path(configured) if configured else DEFAULT_STATUS_PATH
+
+
+async def speech_status(request: web.Request) -> web.Response:
+    """What the voice process last heard, so the page can prove it heard it."""
+    _require_auth(request)
+    status = read_status(speech_status_path())
+    updated = float(status.get("updated", 0) or 0)
+    age = round(time.time() - updated, 2) if updated else None
+    payload = dict(status)
+    payload["age"] = age
+    payload["stale"] = age is None or age > STALE_SECONDS
+    # The turn's own state goes back to waiting as soon as listening stops, so
+    # the end of speech is reported as an event with an age. The page can then
+    # show it for a moment without inventing a state the service is not in.
+    eos_at = float(status.get("eos_at", 0) or 0)
+    payload["eos_age"] = round(time.time() - eos_at, 2) if eos_at else None
+    return web.json_response(payload)
 
 
 async def volume_status(request: web.Request) -> web.Response:
@@ -278,6 +387,18 @@ async def volume_status(request: web.Request) -> web.Response:
     try:
         return web.json_response(await request_volume())
     except RuntimeError as error:
+        raise web.HTTPServiceUnavailable(text=str(error)) from None
+
+async def audio_route_control(request: web.Request) -> web.Response:
+    if request.method == "POST":
+        _require_post(request)
+        body = await _json_body(request)
+        target = body.get("target")
+        if target not in {"computer", "pi"}: raise web.HTTPBadRequest(text="Choose pi or computer.")
+    else:
+        _require_auth(request); target = "status"
+    try: return web.json_response(await request_audio_route(target))
+    except (RuntimeError, ValueError, OSError, TimeoutError) as error:
         raise web.HTTPServiceUnavailable(text=str(error)) from None
 
 
@@ -297,6 +418,42 @@ async def settings_status(request: web.Request) -> web.Response:
     """Every tunable setting, so the dashboard can render editors for them."""
     state = _require_auth(request)
     return web.json_response({"settings": state.settings.public_settings()})
+
+
+async def agent_control(request: web.Request) -> web.Response:
+    state = _require_post(request) if request.method == 'POST' else _require_auth(request)
+    registry = state.session.registry
+    if request.method == 'GET':
+        manager = registry.get('agent_task').manager
+        return web.json_response({'success': True, 'agents': manager.rows()})
+    arguments = await _json_body(request) if request.method == 'POST' else {'action': 'status'}
+    try:
+        result = await registry.execute('agent_task', arguments)
+    except ValueError as error:
+        raise web.HTTPBadRequest(text=str(error)) from None
+    return web.json_response({'success': result.success, 'message': result.spoken_text, **result.data})
+
+
+async def pc_browser_status(request: web.Request) -> web.Response:
+    _require_auth(request)
+    from athena.pc_bridge import browser_request
+    try:
+        return web.json_response(await browser_request({"action": "status"}))
+    except Exception:
+        return web.json_response({"available": False, "keyboard_enabled": False,
+                                  "error": "PC bridge is offline or not configured."})
+
+
+async def pc_keyboard_control(request: web.Request) -> web.Response:
+    _require_post(request)
+    body = await _json_body(request)
+    if type(body.get("enabled")) is not bool:
+        raise web.HTTPBadRequest(text="A true/false keyboard setting is required.")
+    from athena.pc_bridge import browser_request
+    try:
+        return web.json_response(await browser_request({"action": "keyboard_config", "enabled": body["enabled"]}))
+    except Exception:
+        raise web.HTTPBadGateway(text="Could not change PC keyboard control. Check the PC bridge.") from None
 
 
 async def settings_control(request: web.Request) -> web.Response:
@@ -457,7 +614,9 @@ async def audio_stream(request: web.Request) -> web.WebSocketResponse:
         return socket
 
     await socket.send_json({"type": "ready", "microphone_rate": MICROPHONE_RATE,
-                            "speaker_rate": SPEAKER_RATE, "frame_ms": FRAME_MS})
+                            "speaker_rate": SPEAKER_RATE,
+                            "speaker_channels": SPEAKER_CHANNELS,
+                            "frame_ms": FRAME_MS})
 
     async def from_browser() -> None:
         async for message in socket:
@@ -469,9 +628,18 @@ async def audio_stream(request: web.Request) -> web.WebSocketResponse:
                     control = json.loads(message.data)
                 except ValueError:
                     continue
-                if isinstance(control, dict) and control.get("type") == "flush":
+                if not isinstance(control, dict):
+                    continue
+                # A flush has its own frame type because the voice process does
+                # more with it than pass it on. Anything else — what the
+                # browser can do for itself, for instance — is relayed as
+                # control JSON.
+                if control.get("type") == "flush":
                     writer.write(pack_frame(FLUSH_FRAME))
-                    await writer.drain()
+                else:
+                    writer.write(pack_frame(CONTROL_FRAME,
+                                            json.dumps(control).encode("utf-8")))
+                await writer.drain()
 
     async def to_browser() -> None:
         while True:
@@ -480,6 +648,11 @@ async def audio_stream(request: web.Request) -> web.WebSocketResponse:
                 await socket.send_bytes(payload)
             elif frame_type == FLUSH_FRAME:
                 await socket.send_json({"type": "flush"})
+            elif frame_type == CONTROL_FRAME:
+                try:
+                    await socket.send_json(json.loads(payload or b"{}"))
+                except ValueError:
+                    continue
 
     tasks = [asyncio.create_task(from_browser()), asyncio.create_task(to_browser())]
     try:
@@ -506,7 +679,29 @@ async def audio_stream(request: web.Request) -> web.WebSocketResponse:
 
 
 async def health(_: web.Request) -> web.Response:
-    return web.json_response({"ok": True})
+    return web.json_response({"ok": True, "app": "athena", "monitor_schema": 1})
+
+
+async def monitor_status(request: web.Request) -> web.Response:
+    state = _require_auth(request)
+    registry = state.session.registry
+    # These reads never call a language model or start speech.
+    metrics = await asyncio.to_thread(snapshot)
+    workflow = registry.get('background_workflow')
+    return web.json_response({'operations': registry.status_store.rows(),
+        'workflows': workflow.manager.rows() if workflow and workflow.manager else [],
+        'agents': registry.get('agent_task').manager.rows(),
+        'download': read_progress('download'), 'transfer': read_progress('transfer'),
+        'metrics': metrics, 'audio': read_status(speech_status_path()), 'at': time.time()})
+
+
+async def reboot_pi(request: web.Request) -> web.Response:
+    _require_post(request)
+    body = await _json_body(request)
+    if body.get('confirmation') != 'REBOOT PI':
+        raise web.HTTPBadRequest(text='Explicit REBOOT PI confirmation is required.')
+    await _systemctl('reboot', '--no-block')
+    return web.json_response({'ok': True, 'message': 'Pi reboot requested. Reconnect after it starts.'})
 
 
 async def create_app() -> web.Application:
@@ -519,13 +714,22 @@ async def create_app() -> web.Application:
     app.router.add_post("/api/logout", logout)
     app.router.add_get("/api/bootstrap", bootstrap)
     app.router.add_get("/api/status", service_status)
+    app.router.add_get("/api/audio", speech_status)
     app.router.add_post("/api/service", service_control)
     app.router.add_get("/api/music", music_status)
     app.router.add_post("/api/music", music_control)
     app.router.add_get("/api/volume", volume_status)
     app.router.add_post("/api/volume", volume_control)
+    app.router.add_get("/api/audio-route", audio_route_control)
+    app.router.add_post("/api/audio-route", audio_route_control)
     app.router.add_post("/api/prompts", save_prompts)
     app.router.add_get("/api/settings", settings_status)
+    app.router.add_get('/api/monitor', monitor_status)
+    app.router.add_post('/api/reboot', reboot_pi)
+    app.router.add_get('/api/agents', agent_control)
+    app.router.add_post('/api/agents', agent_control)
+    app.router.add_get("/api/pc/browser", pc_browser_status)
+    app.router.add_post("/api/pc/keyboard", pc_keyboard_control)
     app.router.add_post("/api/settings", settings_control)
     app.router.add_get("/api/conversations", conversations)
     app.router.add_post("/api/chat", submit_chat)
@@ -546,8 +750,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default=os.environ.get("ATHENA_WEB_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("ATHENA_WEB_PORT", "8780")))
+    parser.add_argument("--tls-cert", default=os.environ.get(TLS_CERT_ENV, ""))
+    parser.add_argument("--tls-key", default=os.environ.get(TLS_KEY_ENV, ""))
     args = parser.parse_args()
-    web.run_app(create_app(), host=args.host, port=args.port, print=None)
+    try:
+        context = tls_context(args.tls_cert, args.tls_key)
+    except (OSError, ssl.SSLError, ValueError) as error:
+        # Start anyway and the dashboard would serve plain HTTP, which looks like
+        # success while the microphone stays blocked. Refuse instead.
+        print(f"Dashboard cannot start: TLS is not usable ({error})", flush=True)
+        return 1
+    if context is not None:
+        print(f"Dashboard: HTTPS on {args.host}:{args.port}", flush=True)
+    web.run_app(create_app(), host=args.host, port=args.port,
+                ssl_context=context, print=None)
     return 0
 
 

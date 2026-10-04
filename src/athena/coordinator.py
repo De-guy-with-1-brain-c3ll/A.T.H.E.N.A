@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
+from contextlib import AsyncExitStack, asynccontextmanager
+from collections import OrderedDict, deque
 from datetime import datetime
 import os
 import random
@@ -12,7 +13,7 @@ from uuid import UUID, uuid4
 from athena.audio.capture import Microphone
 from athena.audio.playback import Speaker
 from athena.audio.vad import VoiceGate
-from athena.audio.telemetry import AudioStatusWriter
+from athena.audio.telemetry import AudioStatusWriter, LISTENING, SPEECH, WAITING
 from athena.llm.deepseek import DeepSeekLanguageModel, DeepSeekUnavailable
 from athena.llm.speech_chunker import SpeechChunker
 from athena.memory.service import MemoryService
@@ -84,8 +85,33 @@ def listen_while_music() -> bool:
         in {"1", "true", "yes", "on"}
 
 
+def end_of_speech_tone(rate: int) -> bytes:
+    """The sound of the turn closing: two short falling notes, 880 then 587 Hz.
+
+    The acknowledgement chirp rises. This one falls, so "I heard you" and "I
+    have stopped listening" can never be mistaken for one another.
+    """
+    from array import array
+    import math
+
+    attack = max(1, int(rate * 0.008))
+    release = max(1, int(rate * 0.03))
+
+    def note(frequency: int, length: int) -> list[int]:
+        return [
+            int(2400 * min(1.0, i / attack, (length - i) / release)
+                * math.sin(2 * math.pi * frequency * i / rate))
+            for i in range(length)
+        ]
+
+    pcm = array("h", note(880, int(rate * 0.07))
+                + [0] * int(rate * 0.015)
+                + note(587, int(rate * 0.10)))
+    return pcm.tobytes()
+
+
 class VoiceCoordinator:
-    WAKE_ACKS = ("Yes?", "What's up?", "I'm listening.", "Go ahead.",
+    WAKE_ACKS = ("Yes, sir?", "What's up?", "I'm listening.", "Go ahead.",
                  "Ready.", "I'm here.", "How can I help?", "At your service.",
                  "I'm listening, Benjamin.", "What do you need?")
     # A command repeated seconds later is nearly always the user talking over a
@@ -108,10 +134,14 @@ class VoiceCoordinator:
         voice_gate: VoiceGate,
         settings_store: RuntimeSettingsStore,
         audio_debug: bool = False,
+        local_wake_stt=None,
     ) -> None:
         self.microphone = microphone
         self.speaker = speaker
         self.stt = stt
+        # Optional local SenseVoice gate. When present, cloud STT is not opened
+        # until this local decoder finds an utterance containing the wake word.
+        self.local_wake_stt = local_wake_stt
         self.llm = llm
         self.tts = tts
         self.memory = memory
@@ -136,10 +166,14 @@ class VoiceCoordinator:
         self.active_turn: UUID | None = None
         self.background = BackgroundAgents(llm)
         self._ack_pcm = b""
+        self._eos_pcm = b""
         self._alarm_pcm = b""
+        self.eos_tone = os.environ.get("ATHENA_EOS_TONE", "1").strip().lower() not in {
+            "0", "false", "no", "off"}
         self._warm_task: asyncio.Task | None = None
         self._listen_task: asyncio.Task | None = None
         self._external_speech: asyncio.Queue[str] = asyncio.Queue(maxsize=8)
+        self._audio_switch_requests = asyncio.Queue(maxsize=2)
         self._external_changed = asyncio.Event()
         # Desktop/testing stays backwards-compatible; the Orange Pi env enables
         # this for its always-on microphone service.
@@ -167,13 +201,65 @@ class VoiceCoordinator:
             print(f"[dropped, speech queue full] {text[:120]}", flush=True)
             return False
 
-    async def control_music(self, action: str, value: int | None = None) -> dict:
+    async def request_audio_route(self, target="status"):
+        router = getattr(self, "audio_router", None)
+        if router is None: raise RuntimeError("Live audio switching is unavailable on this instance.")
+        if target == "status": return router.status()
+        if target not in {"computer", "pi"}: raise ValueError("Choose pi or computer.")
+        future = asyncio.get_running_loop().create_future()
+        try: self._audio_switch_requests.put_nowait((target, future))
+        except asyncio.QueueFull: raise RuntimeError("An audio switch is already pending.") from None
+        self._external_changed.set()
+        return await asyncio.wait_for(future, 10)
+
+    async def _switch_audio(self, target):
+        router = getattr(self, "audio_router", None)
+        if router is None: raise RuntimeError("Live audio switching is unavailable on this instance.")
+        await self._stop_listening()
+        async with self._audio_focus():
+            result = await router.switch(target)
+        await self.set_volume(self._volume)
+        self.voice_gate.reset()
+        self._active_until = time.monotonic() + 20
+        return result
+
+    async def _handle_fast_audio_control(self, text):
+        command = ToolRegistry.normalize_command(text)
+        if not re.search(r"\b(?:switch|move|use|route|hand|go back|back to)\b", command): return False
+        if not re.search(r"\b(?:audio|speaker|microphone|mic|input|output|devices|listening|pi)\b", command): return False
+        target = "computer" if re.search(r"\b(?:computer|pc|laptop|desktop)\b", command) else "pi" if re.search(r"\b(?:pi|board)\b", command) else None
+        if target is None: return False
+        try:
+            await self._switch_audio(target)
+            await self._speak_text("Microphone and speaker switched to your " + ("computer." if target == "computer" else "Pi."), prompted=True)
+        except (RuntimeError, OSError, ValueError) as error:
+            await self._speak_text(str(error), prompted=True)
+        return True
+
+    @staticmethod
+    def _music_state(player) -> dict:
+        """The player's status, with the saved playlists alongside it.
+
+        One response shape for every music call, so the dashboard can render the
+        playlists without tracking which action it happened to ask for — and so
+        a playlist added from the panel appears in the very next poll.
+        """
+        state = player.status()
+        listing = getattr(player, "playlists", None)
+        if callable(listing):
+            state = {**state, "playlists": listing()}
+        return state
+
+    async def control_music(self, action: str, value: int | None = None,
+                            name: str | None = None, query: str = "",
+                            moods: list[str] | None = None) -> dict:
         tool = self.llm._tools.get("netease_music")
         player = getattr(tool, "player", None)
         if player is None:
             raise RuntimeError("Music is unavailable while ATHENA voice is offline.")
+        message = ""
         if action == "status":
-            return player.status()
+            return self._music_state(player)
         if action == "toggle":
             state = player.status()
             if not state["playing"]:
@@ -191,9 +277,25 @@ class VoiceCoordinator:
             await player.next()
         elif action == "stop":
             await player.stop()
+        elif action == "add_playlist":
+            saved = player.add_playlist(str(name or ""), str(query or ""), moods or [])
+            message = f"Saved the {saved} playlist."
+        elif action == "remove_playlist":
+            removed = player.remove_playlist(str(name or ""))
+            message = f"Removed the {removed} playlist."
+        elif action in {"play_playlist", "auto_play"}:
+            if action == "play_playlist":
+                found = player._named_playlist(str(name or ""))
+                if found is None:
+                    raise RuntimeError("I don't have that playlist. Ask me to list your saved playlists.")
+                chosen, entry = found
+            else:
+                chosen, entry = player.choose_playlist(str(query or ""))
+            await player.play(entry["query"])
+            message = f"Playing the {chosen} playlist."
         else:
             raise RuntimeError("Unknown music command.")
-        return player.status()
+        return {**self._music_state(player), "message": message}
 
     @property
     def volume(self) -> int:
@@ -213,14 +315,17 @@ class VoiceCoordinator:
         return value
 
     async def connect(self) -> None:
-        await asyncio.gather(
+        connections = [
             self.microphone.open(),
             self.speaker.open(),
             self.stt.connect(),
             self.llm.connect(),
             self.tts.connect(),
             self.memory.connect(),
-        )
+        ]
+        if self.local_wake_stt is not None:
+            connections.append(self.local_wake_stt.connect())
+        await asyncio.gather(*connections)
         # Re-apply the remembered level now that the speaker owns a stream.
         await self.set_volume(self._volume)
         # Piper's voice takes most of two seconds to load, and it is the local
@@ -261,11 +366,27 @@ class VoiceCoordinator:
             return int(2400 * envelope * math.sin(2 * math.pi * 880 * phase / rate))
         self._alarm_pcm = sample_bytes(alarm_sample(i) for i in range(alarm_len))
 
+        # A falling pair, the mirror of the acknowledgement chirp, so "I heard
+        # you" and "I have stopped listening" cannot be confused.
+        self._eos_pcm = end_of_speech_tone(rate)
+
     async def run(self) -> None:
         print("ATHENA is ready. Speak a command; press Ctrl+C to stop.")
         try:
             while not self.llm.shutdown_requested:
-                if not self._external_speech.empty():
+                audio_requests = getattr(self, "_audio_switch_requests", None)
+                if audio_requests is not None and not audio_requests.empty():
+                    target, future = self._audio_switch_requests.get_nowait()
+                    if not future.done():
+                        try:
+                            result = await self._switch_audio(target)
+                            if not future.done(): future.set_result(result)
+                        except Exception as error:
+                            if not future.done(): future.set_exception(error)
+                    self._audio_switch_requests.task_done()
+                    self._external_changed.clear()
+                    continue
+                if not self._external_speech.empty() and (not self.background.jobs and self._safe_to_speak()):
                     await self._stop_listening()
                     text = self._external_speech.get_nowait()
                     if self._external_speech.empty():
@@ -274,7 +395,7 @@ class VoiceCoordinator:
                         if text.casefold().startswith("alarm:"):
                             # An alarm the user set always rings, whatever the hour.
                             await self._speak_text(text)
-                            await self.speaker.play(self._alarm_pcm)
+                            await self._play_short_sound(self._alarm_pcm)
                         elif self.quiet_hours():
                             # Nothing unprompted is spoken overnight. It is not
                             # lost: it is printed here and shown on the dashboard.
@@ -284,6 +405,10 @@ class VoiceCoordinator:
                     finally:
                         self._external_speech.task_done()
                     continue
+                if not self._external_speech.empty():
+                    # Reports wait for the conversational floor, never cancel
+                    # capture or talk over a pending answer.
+                    self._external_changed.clear()
                 if self._listen_task is None:
                     self.active_turn = uuid4()
                     self.voice_gate.reset()
@@ -334,27 +459,29 @@ class VoiceCoordinator:
                         self._active_until = time.monotonic() + 20.0
                     else:
                         is_confirmation = self.background.is_confirmation_reply(transcript)
-                        transcript = self._wake_command(transcript, allow_confirmation=is_confirmation)
+                        verified = getattr(self, "_keyword_verified_turn", None) == self.active_turn
+                        command = self._wake_command(transcript, allow_confirmation=is_confirmation)
+                        transcript = transcript.strip() if command is None and verified else command
                         if transcript is None:
                             print("Ignored: wake word not detected.", flush=True)
                             continue
                         self._active_until = time.monotonic() + 20.0
-                        await self.speaker.play(self._ack_pcm)
+                        await self._play_short_sound(self._ack_pcm)
                         if self._sleeping:
                             # Saying the wake word is how sleep mode is left.
                             await self._wake_from_sleep()
                             if not transcript:
                                 continue
-                        if not transcript and await self._offer_brief():
-                            continue
                         if not transcript:
-                            await self._speak_text(random.choice(self.WAKE_ACKS))
+                            await self._speak_text(random.choice(self.WAKE_ACKS), prompted=True)
                             continue
+                if await self._handle_quiet_request(transcript):
+                    continue
                 if ToolRegistry.is_shutdown_command(transcript):
                     await self.background.cancel_all()
                     await self._answer(self.active_turn, transcript)
                     break
-                if self._brief_offer is not None:
+                if self._brief_offer is not None and not self.background.is_confirmation_reply(transcript):
                     key, self._brief_offer = self._brief_offer, None
                     if self._is_affirmative(transcript) and self.alerts is not None:
                         brief = self.alerts.take_brief(key)
@@ -368,12 +495,21 @@ class VoiceCoordinator:
                 elif command in {"background status", "task status", "what are you working on"}:
                     count = len(self.background.jobs)
                     pending = f"I have {count} background request{'s' if count != 1 else ''} pending."
+                    summary = getattr(getattr(self.llm, '_tools', None), 'background_summary', None)
+                    if callable(summary):
+                        details = summary()
+                        if isinstance(details, str):
+                            pending += ' ' + details
                     if self._sleeping:
                         awaiting = status_report().replace("\n", " ")
                         pending += f" Also {awaiting[0].lower()}{awaiting[1:]}"
                     await self._speak_text(pending)
                 elif ToolRegistry.is_download_status_query(transcript):
                     await self._speak_text(self.background.download_status().spoken_text)
+                elif await self._handle_fast_audio_control(transcript):
+                    pass
+                elif await self._handle_browser_status(transcript):
+                    pass
                 elif self.is_memory_status_query(transcript):
                     # Answered from the shared record, so it stays correct when the
                     # pass was started by the dashboard or a scheduled job rather
@@ -381,6 +517,10 @@ class VoiceCoordinator:
                     await self._speak_text(status_report())
                 elif self.is_sleep_command(transcript):
                     await self._enter_sleep()
+                elif await self._handle_fast_music_control(transcript):
+                    pass
+                elif ToolRegistry.is_task_status_query(transcript) and (execution_status := self.background.contextual_status(transcript, self._voice_context())) is not None:
+                    await self._speak_text(execution_status.spoken_text)
                 elif self._is_repeat(transcript):
                     await self._speak_text(random.choice(self.REPEAT_ACKS))
                 else:
@@ -388,7 +528,12 @@ class VoiceCoordinator:
                     if job is None:
                         await self._speak_text("I already have three requests pending. Let one finish, or say cancel background tasks.")
                     else:
+                        if hasattr(job, 'speech_eos_at'):
+                            job.speech_eos_at = getattr(getattr(self, 'audio_status', None), '_payload', {}).get('eos_at')
                         self._remember_command(transcript)
+                    continue  # Offer memos after the actual background reply, not submission.
+                if not self.background.is_confirmation_reply("yes"):
+                    await self._offer_brief()
         finally:
             await self._stop_listening()
             await self.background.cancel_all()
@@ -475,7 +620,9 @@ class VoiceCoordinator:
         the afternoon there may be nobody in the room. This is the moment he is
         actually there, so this is where it gets offered.
         """
-        if self.alerts is None or self._brief_offer is not None:
+        if getattr(self, "alerts", None) is None or getattr(self, "_brief_offer", None) is not None:
+            return False
+        if getattr(getattr(self, "background", None), "jobs", {}):
             return False
         try:
             briefs = self.alerts.brief_rows()
@@ -483,12 +630,39 @@ class VoiceCoordinator:
             return False
         if not briefs:
             return False
-        self._brief_offer = briefs[0]["key"]
+        offered = getattr(self, "_offered_briefs", set())
+        fresh = []
+        for brief in briefs:
+            identity = (brief["key"], brief.get("ready_at", ""))
+            if identity in offered:
+                continue
+            try:
+                ready = datetime.fromisoformat(brief["ready_at"])
+                if (datetime.now(ready.tzinfo) - ready).total_seconds() > 86400:
+                    continue
+            except (KeyError, ValueError, TypeError):
+                pass
+            fresh.append(brief)
+        if not fresh:
+            return False
+        briefs = fresh
         if self.quiet_hours():
             print(f"[quiet hours, not spoken] a brief is ready: {briefs[0]['label']}",
                   flush=True)
             return False
+        self._brief_offer = briefs[0]["key"]
+        offered.add((briefs[0]["key"], briefs[0].get("ready_at", "")))
+        self._offered_briefs = offered
         await self._speak_text(f"I've got {briefs[0]['label']}. Want it?")
+        return True
+
+    async def _handle_browser_status(self, text: str) -> bool:
+        command = ToolRegistry.normalize_command(text)
+        if not re.search(r"\b(?:did you open|is it open|is it opened|have you opened|browser status)\b", command):
+            return False
+        from athena.tools.pc_browser import PCBrowserTool
+        result = await PCBrowserTool().execute({"action": "status"})
+        await self._speak_text(result.spoken_text, prompted=True)
         return True
 
     # ---- Sleep mode ---------------------------------------------------------
@@ -601,9 +775,17 @@ class VoiceCoordinator:
         word = re.escape(self.wake_word)
         # STT commonly renders the name as two words; accept only these close
         # variants and only at the beginning, so room conversation is ignored.
-        pattern = rf"^\s*(?:hey\s+)?(?:{word}|a\s+tina|a\s+thena|athina)\b[\s,:;.!?-]*(.*)$"
+        pattern = rf"^\s*(?:hey\s+)?(?:{word}|a\s+tina|a\s+thena|athina|atheina|ethena)\b[\s,:;.!?-]*(.*)$"
         match = re.match(pattern, text.casefold())
         return match.group(1).strip() if match else None
+
+    async def _handle_quiet_request(self, text: str) -> bool:
+        command = re.sub(r"[^a-z ]", "", text.casefold()).strip()
+        if command not in {"thats enough for now", "go quiet", "stop listening", "standby"}:
+            return False
+        await self._speak_text("Very well.")
+        self._active_until = 0.0
+        return True
 
     async def _stop_listening(self):
         task, self._listen_task = self._listen_task, None
@@ -622,7 +804,7 @@ class VoiceCoordinator:
             if acknowledgement:
                 job.acknowledged = True
                 print(f"A.T.H.E.N.A: On it. [background {str(job.id)[:8]}]")
-                await self.speaker.play(self._ack_pcm)
+                await self._play_short_sound(self._ack_pcm)
             else:
                 print(f"[Result for: {job.text[:100]}]")
                 if job.reply_started:
@@ -630,6 +812,8 @@ class VoiceCoordinator:
                     # than waiting for the last token to arrive; this is the
                     # critical path for a natural voice response.
                     job.delivery_started = True
+                    self._delivery_eos_at = getattr(job, 'speech_eos_at', None)
+                    self._delivery_first_text_at = getattr(job, 'first_text_at', None)
                     await self._answer_stream(self.active_turn, job.text,
                                               self.background.reply_stream(job))
                 else:
@@ -640,11 +824,79 @@ class VoiceCoordinator:
                     await self.memory.remember_turn(
                         job.id, job.text, job.reply or "No answer returned.")
                 self.background.delivered(job)
+                if not getattr(self.background, "is_confirmation_reply", lambda _text: False)("yes"):
+                    await self._offer_brief()
         finally:
             if task is not None:
                 await asyncio.gather(task, return_exceptions=True)
 
+    @asynccontextmanager
+    async def _audio_focus(self):
+        music_tool = self.llm._tools.get("netease_music")
+        player = getattr(music_tool, "player", None)
+        if player is not None:
+            player.suspend_for_voice()
+        try:
+            settle = getattr(player, "wait_for_voice", None)
+            if asyncio.iscoroutinefunction(settle):
+                await settle()
+            yield
+        finally:
+            try:
+                if asyncio.current_task().cancelling():
+                    await self.speaker.stop()
+                else:
+                    finish = getattr(self.speaker, "finish_playback", None)
+                    if asyncio.iscoroutinefunction(finish):
+                        await finish()
+            finally:
+                if player is not None:
+                    player.resume_after_voice()
+
+    async def _play_short_sound(self, pcm):
+        async with self._audio_focus():
+            await self.speaker.play(pcm)
+
+    async def _handle_fast_music_control(self, text):
+        command = ToolRegistry.normalize_command(text)
+        actions = {"pause": "pause", "pause music": "pause", "pause the music": "pause",
+                   "resume music": "resume", "resume the music": "resume", "resume": "resume",
+                   "next": "next", "next track": "next", "next song": "next", "skip": "next", "skip track": "next",
+                   "continue music": "resume", "continue": "resume",
+                   "stop music": "stop", "stop the music": "stop"}
+        action = actions.get(command)
+        if not action:
+            return False
+        tools = getattr(self.llm, "_tools", None)
+        tool = tools.get("netease_music") if tools is not None else None
+        if getattr(tool, "player", None) is None:
+            return False
+        result = await tool.execute({"action": action})
+        await self._speak_text(result.spoken_text, prompted=True)
+        memory = getattr(self, "memory", None)
+        if memory is not None:
+            await memory.remember_turn(uuid4(), text, result.spoken_text)
+        return True
+
+    def _music_is_audible(self):
+        tools = getattr(self.llm, "_tools", None)
+        tool = tools.get("netease_music") if tools is not None else None
+        status = getattr(getattr(tool, "player", None), "status", None)
+        if not callable(status):
+            return False
+        try:
+            state = status()
+        except Exception:
+            return False
+        return isinstance(state, dict) and bool(state.get("playing")) and not state.get("paused", False)
+
     async def _speak_text(self, text, prompted: bool = False):
+        async with self._audio_focus():
+            await self._speak_text_impl(text, prompted)
+        if prompted and self.wake_word and self._active_until > 0:
+            self._active_until = time.monotonic() + 20.0
+
+    async def _speak_text_impl(self, text, prompted: bool = False):
         """Speak text. `prompted` means the user asked for this reply.
 
         Only a reply they asked for reopens the hands-free window. A watcher
@@ -654,11 +906,28 @@ class VoiceCoordinator:
         turn = uuid4()
         self.active_turn = turn
         self.state = AgentState.SPEAKING
-        music_tool = self.llm._tools.get("netease_music")
-        music_player = getattr(music_tool, "player", None)
-        if music_player is not None:
-            music_player.suspend_for_voice()
         print(f"A.T.H.E.N.A: {text}")
+        if getattr(self.speaker, "can_speak_text", False):
+            # The computer that is already listening has a voice of its own.
+            # Letting it speak keeps synthesis, decoding and pacing off the
+            # board completely, and removes a cloud round trip from every
+            # reply. It only applies while a browser that claimed the
+            # capability is actually connected.
+            spoken = False
+            try:
+                print("[speech] spoken by the connected computer "
+                      "(nothing synthesized on the board)", flush=True)
+                spoken = await self.speaker.speak_text(text)
+            except Exception:
+                print("Speech output failed; the answer is printed above.")
+            finally:
+                self.state = AgentState.IDLE
+                if prompted and self.wake_word and self._active_until > 0:
+                    self._active_until = time.monotonic() + 20.0
+            if spoken:
+                return
+            print("[speech] browser speech failed; trying synthesized audio.", flush=True)
+            self.state = AgentState.SPEAKING
         cached = self._cached_speech(text)
         if cached:
             # Already spoken before, so it costs nothing to say again.
@@ -668,8 +937,6 @@ class VoiceCoordinator:
                 await self.speaker.play(cached)
             finally:
                 self.state = AgentState.IDLE
-                if music_player is not None:
-                    music_player.resume_after_voice()
             return
         collected: list[bytes] = []
         playback = asyncio.create_task(self._play_audio(turn, collected))
@@ -712,14 +979,23 @@ class VoiceCoordinator:
             await asyncio.gather(playback, return_exceptions=True)
             await self.tts.cancel(turn)
             self.state = AgentState.IDLE
-            if music_player is not None:
-                music_player.resume_after_voice()
             if prompted and self.wake_word and self._active_until > 0:
                 # Give the user the full follow-up window after ATHENA finishes
                 # speaking instead of consuming it during TTS or tool work.
                 self._active_until = time.monotonic() + 20.0
 
-    async def _listen(self, turn_id: UUID) -> str:
+    async def _play_end_of_speech_tone(self) -> None:
+        """Say out loud that the turn just closed."""
+        pcm = getattr(self, "_eos_pcm", b"")
+        if not pcm or not getattr(self, "eos_tone", False):
+            return
+        try:
+            await self._play_short_sound(pcm)
+        except Exception:
+            print("End-of-speech tone failed to play; carrying on.", flush=True)
+
+    async def _listen_local_wake(self, turn_id: UUID) -> str:
+        """Reject background speech locally, but use Qwen for real commands."""
         self.state = AgentState.LISTENING
         self.settings_store.reload()
         self.voice_gate.configure(
@@ -730,6 +1006,142 @@ class VoiceCoordinator:
             minimum_speech_ms=self.settings_store.get("vad_minimum_speech_ms"),
         )
         self.voice_gate.reset()
+        self.audio_status.state(LISTENING, turn=str(turn_id))
+        self.audio_status.heard("")
+        chunks: list[bytes] = []
+        total_bytes = 0
+        frames_seen = 0
+        cap = segment_cap_bytes()
+        music_note_shown = False
+        was_active = False
+
+        def music_is_playing() -> bool:
+            try:
+                tool = self.llm._tools.get("netease_music")
+                state = getattr(getattr(tool, "player", None), "status", lambda: {})()
+                return isinstance(state, dict) and bool(state.get("playing")) and not state.get("paused", False)
+            except Exception:
+                return False
+
+        try:
+            print("Listening locally for the wake word...", flush=True)
+            async for frame in self.microphone.frames():
+                if self.active_turn != turn_id:
+                    return ""
+                accepted = self.voice_gate.process(frame)
+                if (accepted and not listen_while_music() and music_is_playing()):
+                    if not music_note_shown:
+                        music_note_shown = True
+                        print("[audio] music is playing; local wake detection paused", flush=True)
+                    self.voice_gate.reset()
+                    continue
+                for packet in accepted:
+                    chunks.append(packet)
+                    total_bytes += len(packet)
+                frames_seen += 1
+                if frames_seen % 25 == 0 or self.voice_gate.active != was_active:
+                    self.audio_status.update(
+                        rms=self.voice_gate.last_rms,
+                        noise=self.voice_gate.noise_rms,
+                        threshold=self.voice_gate.threshold,
+                        speech=self.voice_gate.active,
+                        voiced_frames=self.voice_gate.voiced_frames,
+                        retained_frames=len(chunks),
+                        retained_seconds=len(chunks) * self.voice_gate.frame_ms / 1000.0,
+                    )
+                was_active = self.voice_gate.active
+                if total_bytes >= cap or self.voice_gate.should_end:
+                    break
+            if not chunks or not self.voice_gate.has_enough_speech:
+                return ""
+            self.audio_status.endpoint(turn=str(turn_id), frames=len(chunks),
+                                       seconds=total_bytes / 32_000)
+            await self._play_end_of_speech_tone()
+            text = await self.local_wake_stt.transcribe_once(b"".join(chunks))
+            text = (text or "").strip()
+            if not text:
+                return ""
+            # The local model is only a cheap gate. It is not the recognizer
+            # whose words the conversation uses: keep the previous Qwen STT
+            # behaviour for commands, follow-ups and approval replies.
+            active = time.monotonic() < self._active_until
+            confirmation = self.background.is_confirmation_reply(text)
+            if self.wake_word and not (active or confirmation or self._wake_command(text) is not None):
+                print("[audio] background speech rejected locally; no cloud audio sent.",
+                      flush=True)
+                return ""
+            cloud_text = await self._transcribe_cloud_pcm(turn_id, b"".join(chunks))
+            if not cloud_text:
+                return ""
+            print(f"You: {cloud_text}", flush=True)
+            self.audio_status.transcript(cloud_text)
+            return cloud_text
+        finally:
+            self.audio_status.state(WAITING)
+            self.voice_gate.reset()
+
+    async def _transcribe_cloud_pcm(self, turn_id: UUID, pcm: bytes) -> str:
+        """Replay one locally approved utterance to the normal cloud STT."""
+        await self.stt.start_turn(turn_id)
+        print(f"[audio] sending {len(pcm) / 32_000:.2f}s of approved speech to Qwen STT.",
+              flush=True)
+
+        async def send() -> None:
+            for offset in range(0, len(pcm), 3200):
+                await self.stt.send_audio(pcm[offset:offset + 3200])
+            await self.stt.finish_turn()
+
+        sender = asyncio.create_task(send())
+        try:
+            async with asyncio.timeout(15):
+                await sender
+                async for result in self.stt.results():
+                    if result.turn_id != turn_id or not result.is_final:
+                        continue
+                    if result.text == "[STT complete]" or result.text.startswith("[STT error]"):
+                        return ""
+                    return result.text.strip() if self._accept_transcript(result.text) else ""
+        except TimeoutError:
+            print("[audio] Qwen STT timed out; listening again.", flush=True)
+        finally:
+            if not sender.done():
+                sender.cancel()
+            await asyncio.gather(sender, return_exceptions=True)
+            if sender.cancelled() or sender.exception() is not None:
+                await self.stt.finish_turn()
+        return ""
+
+    async def _listen(self, turn_id: UUID) -> str:
+        # Follow-ups and pending approvals already belong to this conversation:
+        # stream them straight to Qwen instead of paying for a second decode.
+        conversation_open = (
+            time.monotonic() < self._active_until
+            or self.background.approval_model is not None
+            or getattr(self.llm._tools, "has_pending_approval", False) is True
+        )
+        detector = self.local_wake_stt if not conversation_open else None
+        # Keep music out of cloud STT even during the active window, but allow
+        # local keyword activation so "ATHENA, pause music" still works.
+        if (not listen_while_music() and self._music_is_audible()
+                and getattr(self.local_wake_stt, "streaming", False) is True):
+            detector = self.local_wake_stt
+        keyword_gate = detector if getattr(detector, "streaming", False) is True else None
+        if detector is not None and keyword_gate is None:
+            return await self._listen_local_wake(turn_id)
+        if keyword_gate is not None:
+            keyword_gate.reset()
+        self.state = AgentState.LISTENING
+        self.settings_store.reload()
+        self.voice_gate.configure(
+            minimum_rms=self.settings_store.get("vad_minimum_rms"),
+            noise_multiplier=self.settings_store.get("vad_noise_multiplier"),
+            end_silence_ms=self.settings_store.get("vad_end_silence_ms"),
+            start_ms=self.settings_store.get("vad_start_ms"),
+            minimum_speech_ms=self.settings_store.get("vad_minimum_speech_ms"),
+        )
+        self.voice_gate.reset()
+        self.audio_status.state(LISTENING, turn=str(turn_id))
+        self.audio_status.heard("")
         # Do not open a cloud STT turn while the room is silent. The local VAD
         # runs first and only starts DashScope after speech is confirmed; this
         # saves idle sessions, audio transfer, and the connection setup delay.
@@ -754,20 +1166,37 @@ class VoiceCoordinator:
                 state = status()
             except Exception:
                 return False
-            return isinstance(state, dict) and bool(state.get("playing"))
+            return isinstance(state, dict) and bool(state.get("playing")) and not state.get("paused", False)
 
         async def capture() -> None:
             frames_seen = 0
             was_active = False
             streamed_bytes = 0
+            retained_frames = 0
             cap = segment_cap_bytes()
             music_note_shown = False
+            keyword_buffer = deque(maxlen=150)  # Three seconds of name/onset.
+
+            async def approve_keyword() -> None:
+                self._keyword_verified_turn = turn_id
+                speech_started.set()
+                for packet in keyword_buffer:
+                    await audio_queue.put(packet)
+                keyword_buffer.clear()
+
+            def retained_seconds() -> float:
+                return retained_frames * self.voice_gate.frame_ms / 1000.0
+
+            def dropped() -> tuple[int, float]:
+                return (int(getattr(self.microphone, "dropped_frames", 0) or 0),
+                        float(getattr(self.microphone, "dropped_seconds", 0.0) or 0.0))
+
             async for frame in self.microphone.frames():
                 if self.active_turn != turn_id:
                     capture_finished.set()
                     return
                 accepted_frames = self.voice_gate.process(frame)
-                if (accepted_frames and not speech_started.is_set()
+                if (accepted_frames and keyword_gate is None and not speech_started.is_set()
                         and not listen_while_music() and music_is_playing()):
                     # The "speech" is the song itself. Streaming it bills every
                     # second and the transcript comes back as phantom commands.
@@ -777,11 +1206,19 @@ class VoiceCoordinator:
                               "it stops (ATHENA_LISTEN_WHILE_MUSIC=1 to change)",
                               flush=True)
                     self.voice_gate.reset()
+                    if keyword_gate is not None:
+                        keyword_gate.reset()
                     continue
                 for accepted_frame in accepted_frames:
-                    speech_started.set()
-                    await audio_queue.put(accepted_frame)
                     streamed_bytes += len(accepted_frame)
+                    retained_frames += 1
+                    if keyword_gate is not None and not speech_started.is_set():
+                        keyword_buffer.append(accepted_frame)
+                        if await keyword_gate.process(accepted_frame):
+                            await approve_keyword()
+                    else:
+                        speech_started.set()
+                        await audio_queue.put(accepted_frame)
                 if streamed_bytes >= cap:
                     # A segment that never goes quiet (music, a busy room) is
                     # cut here: what was said so far is finalised and answered
@@ -797,12 +1234,17 @@ class VoiceCoordinator:
                 # Writing it on every fifth frame cost a synchronous file write
                 # ten times a second inside the capture loop for no visible gain.
                 if frames_seen % 25 == 0 or self.voice_gate.active != was_active:
+                    dropped_frames, dropped_seconds = dropped()
                     self.audio_status.update(
                         rms=self.voice_gate.last_rms,
                         noise=self.voice_gate.noise_rms,
                         threshold=self.voice_gate.threshold,
                         speech=self.voice_gate.active,
                         voiced_frames=self.voice_gate.voiced_frames,
+                        retained_frames=retained_frames,
+                        retained_seconds=retained_seconds(),
+                        dropped_frames=dropped_frames,
+                        dropped_seconds=dropped_seconds,
                     )
                 if self.audio_debug and (frames_seen % 50 == 0 or self.voice_gate.active != was_active):
                     print(
@@ -811,20 +1253,43 @@ class VoiceCoordinator:
                         f"noise={self.voice_gate.noise_rms:.0f} "
                         f"threshold={self.voice_gate.threshold:.0f} "
                         f"speech={'yes' if self.voice_gate.active else 'no'} "
-                        f"voiced_frames={self.voice_gate.voiced_frames}",
+                        f"voiced_frames={self.voice_gate.voiced_frames} "
+                        f"retained={retained_seconds():.2f}s "
+                        f"dropped={dropped()[1]:.2f}s",
                         flush=True,
                     )
                 was_active = self.voice_gate.active
                 if self.voice_gate.should_end:
+                    if keyword_gate is not None and not speech_started.is_set():
+                        if await keyword_gate.process(b"", final=True):
+                            await approve_keyword()
+                        else:
+                            print("[audio] background speech ignored locally; cloud audio=0s.", flush=True)
+                            capture_finished.set()
+                            return
                     # Commit locally as soon as the silence window closes. The
                     # sender task will finish the cloud turn after queued PCM.
+                    dropped_frames, dropped_seconds = dropped()
+                    print(f"[audio] end of speech after {retained_seconds():.2f}s "
+                          f"retained ({retained_frames} frames), "
+                          f"{dropped_seconds:.2f}s dropped", flush=True)
+                    self.audio_status.endpoint(
+                        turn=str(turn_id),
+                        frames=retained_frames,
+                        seconds=retained_seconds(),
+                        dropped_frames=dropped_frames,
+                        dropped_seconds=dropped_seconds,
+                    )
+                    await self._play_end_of_speech_tone()
                     await audio_queue.put(None)
                     capture_finished.set()
                     return
+            await audio_queue.put(None)
             capture_finished.set()
 
         capture_task = None
         sender_task = None
+        cloud_started = False
         waits: list[asyncio.Task] = []
         try:
             capture_task = asyncio.create_task(capture())
@@ -841,6 +1306,7 @@ class VoiceCoordinator:
                 return ""
             if self.active_turn != turn_id or not self.voice_gate.active:
                 return ""
+            cloud_started = True
             await self.stt.start_turn(turn_id)
             print("\nListening...")
 
@@ -873,13 +1339,19 @@ class VoiceCoordinator:
                 if result.is_final:
                     if result.text.startswith("[STT error]"):
                         print("Speech recognition failed; listening again.")
+                        self.audio_status.heard("")
                         return ""
                     if not self._accept_transcript(result.text):
                         print("Ignored: sound was too short to be speech.")
+                        self.audio_status.heard(result.text)
                         self.voice_gate.reset()
                         continue
+                    self.audio_status.transcript(result.text)
                     return result.text
+                self.audio_status.state(SPEECH, turn=str(turn_id))
+                self.audio_status.heard(result.text)
         finally:
+            self.audio_status.state(WAITING)
             # Cancellation while suspended in asyncio.wait() skips the cleanup
             # above, so the event-wait tasks are always reaped here. Leaving them
             # pending leaked a task on every interrupted listen.
@@ -895,7 +1367,8 @@ class VoiceCoordinator:
                 sender_task.cancel()
                 await asyncio.gather(sender_task, return_exceptions=True)
             try:
-                await self.stt.finish_turn()
+                if cloud_started:
+                    await self.stt.finish_turn()
             except Exception as error:
                 # This cleanup runs even when a final transcript has already
                 # been accepted above. If finish_turn itself fails, letting
@@ -938,8 +1411,31 @@ class VoiceCoordinator:
     async def _answer_stream(self, turn_id: UUID, transcript: str, fragments) -> None:
         """Speak model fragments as they arrive from a foreground or queued job."""
         self.state = AgentState.THINKING
+        self._reply_timing = {'turn': turn_id, 'started': time.monotonic(), 'first_text': None}
+        self._reply_timing['eos_at'] = getattr(self, '_delivery_eos_at', None)
+        self._reply_timing['first_text_at'] = getattr(self, '_delivery_first_text_at', None)
+        self._delivery_eos_at = self._delivery_first_text_at = None
         chunker = SpeechChunker()
-        playback_task = asyncio.create_task(self._play_audio(turn_id))
+        native_voice = bool(getattr(self.speaker, "can_speak_text", False))
+        playback_task = None if native_voice else asyncio.create_task(self._play_audio(turn_id))
+        used_pcm = False
+
+        async def emit(clause):
+            nonlocal native_voice, used_pcm, playback_task
+            if native_voice:
+                async with self._audio_focus():
+                    try:
+                        spoken = await self.speaker.speak_text(clause)
+                    except Exception:
+                        spoken = False
+                if spoken:
+                    return
+                native_voice = False
+                print("[speech] browser speech failed; trying synthesized audio.", flush=True)
+            used_pcm = True
+            if playback_task is None:
+                playback_task = asyncio.create_task(self._play_audio(turn_id))
+            await self._send_clause(turn_id, clause)
         response_parts: list[str] = []
         sent_audio = False
         spoken_characters = 0
@@ -951,12 +1447,15 @@ class VoiceCoordinator:
                     return
                 response_parts.append(fragment)
                 print(fragment, end="", flush=True)
+                timing = getattr(self, '_reply_timing', {})
+                if fragment and timing.get('turn') == turn_id and timing.get('first_text') is None:
+                    timing['first_text'] = time.monotonic() - timing['started']
                 for clause in chunker.feed(fragment):
                     if self._budget_reached(spoken_characters):
                         skipped_characters += len(clause)
                         continue
                     self.state = AgentState.SPEAKING
-                    await self._send_clause(turn_id, clause)
+                    await emit(clause)
                     spoken_characters += len(clause)
                     sent_audio = True
             for clause in chunker.finish():
@@ -965,7 +1464,7 @@ class VoiceCoordinator:
                 if self._budget_reached(spoken_characters):
                     skipped_characters += len(clause)
                     continue
-                await self._send_clause(turn_id, clause)
+                await emit(clause)
                 spoken_characters += len(clause)
                 sent_audio = True
             print()
@@ -973,7 +1472,9 @@ class VoiceCoordinator:
                 print(f"[speech stopped by ATHENA_TTS_MAX_CHARS after "
                       f"{spoken_characters} characters; {skipped_characters} not spoken]",
                       flush=True)
-            if sent_audio:
+            if sent_audio and not used_pcm:
+                print("[speech] streamed reply spoken by the connected computer (no cloud TTS).", flush=True)
+            if sent_audio and used_pcm:
                 # Bound synthesis, which can stall on the network — but NOT
                 # playback. Putting the playback inside the same 30 second clock
                 # cut the audio off mid-sentence on any reply longer than about
@@ -1008,16 +1509,19 @@ class VoiceCoordinator:
             # assistant running instead of letting the turn kill the service.
             print(f"\nThat turn failed ({type(error).__name__}); the answer is printed above.")
         finally:
-            if not playback_task.done():
+            if playback_task is not None and not playback_task.done():
                 playback_task.cancel()
             # Always retrieve the playback task: if it already finished with an
             # exception, not awaiting it hides the failure and warns at shutdown.
-            await asyncio.gather(playback_task, return_exceptions=True)
+            if playback_task is not None:
+                await asyncio.gather(playback_task, return_exceptions=True)
             # Release the synthesis session. Without this a superseded answer
             # left its realtime socket open and billing until some later turn
             # happened to clean it up — or never, if the user walked away.
             await self.tts.cancel(turn_id)
             self.state = AgentState.IDLE
+            if self.wake_word and self._active_until > 0 and self.active_turn == turn_id:
+                self._active_until = time.monotonic() + 20.0
 
     def _cached_speech(self, text: str) -> bytes | None:
         """Audio for text that has already been spoken, if it is still held."""
@@ -1043,18 +1547,35 @@ class VoiceCoordinator:
         can keep the phrase for a free replay next time.
         """
         played = 0
-        async for chunk in self.tts.audio(turn_id):
-            if chunk.turn_id != turn_id:
-                continue
-            if self.active_turn != turn_id:
-                # A newer turn took over, so this audio is deliberately dropped.
-                print(f"[speech] playback stopped: turn {turn_id} was superseded "
-                      f"after {played} bytes", flush=True)
-                return played
-            await self.speaker.play(chunk.pcm)
-            played += len(chunk.pcm)
-            if collect is not None:
-                collect.append(chunk.pcm)
+        async with AsyncExitStack() as focus:
+            focused = False
+            async for chunk in self.tts.audio(turn_id):
+                if chunk.turn_id != turn_id:
+                    continue
+                if self.active_turn != turn_id:
+                    print(f"[speech] playback stopped: turn {turn_id} was superseded "
+                          f"after {played} bytes", flush=True)
+                    return played
+                if not focused:
+                    await focus.enter_async_context(self._audio_focus())
+                    focused = True
+                    timing = getattr(self, '_reply_timing', {})
+                    if timing.get('turn') == turn_id:
+                        from athena.metrics import record
+                        sample = {
+                            'answer_to_audio_ready_ms': round((time.monotonic() - timing['started']) * 1000),
+                            'answer_to_first_text_ms': round((timing.get('first_text') or 0) * 1000),
+                            'note': 'Endpoint includes silence detection; audio ready is not physical speaker latency.'}
+                        eos = timing.get('eos_at')
+                        if eos and 0 <= time.time() - eos < 600:
+                            sample['endpoint_to_audio_ready_ms'] = round((time.time() - eos) * 1000)
+                            if timing.get('first_text_at'):
+                                sample['endpoint_to_first_text_ms'] = round(max(0, timing['first_text_at'] - eos) * 1000)
+                        asyncio.create_task(asyncio.to_thread(record, 'voice_latency', sample))
+                await self.speaker.play(chunk.pcm)
+                played += len(chunk.pcm)
+                if collect is not None:
+                    collect.append(chunk.pcm)
         return played
 
     async def cancel_active_turn(self, reason: str = "interrupted") -> None:
@@ -1087,6 +1608,7 @@ class VoiceCoordinator:
         await self.cancel_active_turn("shutdown")
         await asyncio.gather(
             self.stt.close(),
+            *( [self.local_wake_stt.close()] if self.local_wake_stt is not None else []),
             self.tts.close(),
             self.llm.close(),
             self.memory.close(),

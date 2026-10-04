@@ -244,6 +244,11 @@ class EndOfSpeechTests(unittest.TestCase):
         self.assertEqual(Settings.__dataclass_fields__["vad_end_silence_ms"].default, 750)
         self.assertEqual(spec.default, 750)
 
+    def test_the_service_default_is_not_overridden_without_measurement(self):
+        """A live server threshold can add seconds after capture has ended."""
+        from athena.config import Settings
+        self.assertIsNone(Settings.__dataclass_fields__["stt_max_sentence_silence_ms"].default)
+
     def test_it_can_still_be_tuned_both_ways(self):
         from athena.settings.store import CATALOG
         spec = CATALOG["vad_end_silence_ms"]

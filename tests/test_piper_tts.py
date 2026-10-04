@@ -5,7 +5,7 @@ import os
 import stat
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from athena.tts import (
@@ -15,7 +15,13 @@ from athena.tts import (
     synthesizer_sample_rate,
     tts_backend,
 )
-from athena.tts.piper import find_voice, piper_available, piper_sample_rate
+from athena.tts.piper import (
+    find_voice,
+    piper_available,
+    piper_idle_seconds,
+    piper_input_text,
+    piper_sample_rate,
+)
 
 
 # A stand-in for the piper binary: reads a line at a time and writes a fixed
@@ -27,6 +33,21 @@ FAKE_PIPER = '''import sys
 for line in sys.stdin:
     if not line.strip():
         continue
+    sys.stdout.buffer.write(b"\\x11\\x22" * 20000)
+    sys.stdout.buffer.flush()
+'''
+
+# Delaying the warm-up phrase gives a real `send_text()` call time to arrive
+# while `warm()` owns a process that has not yet been made live.  That is the
+# startup race the production coordinator hits when somebody speaks straight
+# after ATHENA announces it is ready.
+SLOW_WARM_PIPER = '''import sys
+import time
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    if line.strip() == "Hi.":
+        time.sleep(0.15)
     sys.stdout.buffer.write(b"\\x11\\x22" * 20000)
     sys.stdout.buffer.flush()
 '''
@@ -44,6 +65,13 @@ def make_fake_piper(directory: Path) -> tuple[str, list[str]]:
     import sys
     script = directory / "fake_piper.py"
     script.write_text(FAKE_PIPER, encoding="utf-8")
+    return sys.executable, [str(script)]
+
+
+def make_slow_warm_piper(directory: Path) -> tuple[str, list[str]]:
+    import sys
+    script = directory / "slow_warm_piper.py"
+    script.write_text(SLOW_WARM_PIPER, encoding="utf-8")
     return sys.executable, [str(script)]
 
 
@@ -92,6 +120,13 @@ class BackendSelectionTests(unittest.TestCase):
             self.assertEqual(piper_sample_rate(), 16_000)
         with patch.dict(os.environ, {"ATHENA_PIPER_SAMPLE_RATE": "nonsense"}):
             self.assertEqual(piper_sample_rate(), 22_050)
+
+    def test_piper_stays_warm_until_explicitly_configured_to_retire(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ATHENA_PIPER_IDLE_SECONDS", None)
+            self.assertEqual(piper_idle_seconds(), 0)
+        with patch.dict(os.environ, {"ATHENA_PIPER_IDLE_SECONDS": "180"}):
+            self.assertEqual(piper_idle_seconds(), 180)
 
 
 class VoiceLookupTests(unittest.TestCase):
@@ -243,6 +278,81 @@ class ReusedProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(first, "warming started nothing")
         self.assertIs(second, first, "warming twice started a second process")
 
+    async def test_first_reply_reuses_the_process_being_warmed(self):
+        """Boot warm-up and an immediate first reply must not load Piper twice."""
+        binary, prefix = make_slow_warm_piper(Path(self._directory.name))
+        speaker = PiperSynthesizer(
+            voice=str(self.voice), binary=binary, prefix_args=prefix,
+            sample_rate=22_050, idle_seconds=0)
+        await speaker.connect()
+        try:
+            with patch.object(speaker, "_spawn", wraps=speaker._spawn) as spawn:
+                warm = asyncio.create_task(speaker.warm())
+                # Let warm() own its local process and begin waiting for its output.
+                await asyncio.sleep(0.03)
+                turn = uuid4()
+                send = asyncio.create_task(speaker.send_text(turn, "Hello."))
+                await asyncio.gather(warm, send)
+                self.assertTrue(warm.result())
+                await speaker.flush(turn)
+                audio = b"".join([chunk.pcm async for chunk in speaker.audio(turn)])
+                self.assertEqual(spawn.call_count, 1,
+                                 "warm-up and the first reply launched separate Pipers")
+        finally:
+            await speaker.close()
+        self.assertEqual(len(audio), 40_000)
+
+    async def test_cancelling_warm_up_reaps_its_unassigned_process(self):
+        """Shutdown during boot warm-up must not leave Piper running."""
+        class Input:
+            def __init__(self):
+                self.closed = False
+
+            def write(self, _data):
+                pass
+
+            async def drain(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        class Output:
+            async def read(self, _size):
+                await asyncio.Event().wait()
+
+        class Process:
+            def __init__(self):
+                self.stdin = Input()
+                self.stdout = Output()
+                self.returncode = None
+                self.killed = False
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self):
+                return self.returncode
+
+        process = Process()
+        speaker = self.speaker()
+        await speaker.connect()
+        try:
+            with patch.object(speaker, "_spawn", AsyncMock(return_value=process)) as spawn:
+                warm = asyncio.create_task(speaker.warm())
+                await asyncio.sleep(0.01)
+                warm.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await warm
+                self.assertEqual(spawn.await_count, 1)
+                self.assertTrue(process.killed,
+                                "the locally owned warm-up process was not reaped")
+                self.assertTrue(process.stdin.closed)
+                self.assertIsNone(speaker._process)
+        finally:
+            await speaker.close()
+
     async def test_a_missing_voice_is_reported_at_connect_not_at_warm(self):
         # The failure belongs on the path that already reports it clearly, so
         # warm() never has to invent a message of its own.
@@ -369,6 +479,10 @@ class PiperVoiceDownloadPathTests(unittest.TestCase):
 
 
 class PiperEnvironmentTests(unittest.TestCase):
+    def test_typographic_punctuation_is_safe_for_the_cli(self):
+        self.assertEqual(piper_input_text("Got it — CJ's at 4:30…"),
+                         "Got it - CJ's at 4:30...")
+
     def test_piper_is_started_unbuffered(self):
         # Without this Piper reads its input ahead into a buffer and stalls after
         # the first sentence with the process healthy — so the second reply of a

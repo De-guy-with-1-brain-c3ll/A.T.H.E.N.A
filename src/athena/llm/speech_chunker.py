@@ -33,9 +33,12 @@ class SpeechChunker:
 
     def _split_position(self) -> int | None:
         for index, character in enumerate(self._buffer):
-            if character in ".!?;" and index + 1 >= 2:
+            if character == "." and index and self._buffer[index - 1].isdigit():
+                if index + 1 == len(self._buffer) or self._buffer[index + 1].isdigit():
+                    continue
+            if character in ".!?;。！？；" and index + 1 >= 2:
                 return index + 1
-            if character == "," and index + 1 >= self._comma_threshold:
+            if character in ",，" and index + 1 >= self._comma_threshold:
                 return index + 1
         if len(self._buffer) < self._hard_limit:
             return None

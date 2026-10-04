@@ -24,6 +24,8 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(coordinator._wake_command("the room is quiet"))
         self.assertEqual(coordinator._wake_command("Athena, what time is it"), "what time is it")
         self.assertEqual(coordinator._wake_command("hey a tina weather"), "weather")
+        self.assertEqual(coordinator._wake_command("Ethena, what time is it"), "what time is it")
+        self.assertEqual(coordinator._wake_command("Atheina, what time is it"), "what time is it")
         self.assertEqual(coordinator._wake_command("yes", allow_confirmation=True), "yes")
     async def test_local_end_silence_commits_stt_turn(self):
         from array import array
@@ -68,6 +70,98 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
         transcript = await asyncio.wait_for(coordinator._listen(turn), 1)
         self.assertEqual(transcript, 'hello athena')
         self.assertGreaterEqual(stt.finish_calls, 1)
+
+    async def test_local_wake_gate_uses_qwen_for_a_command(self):
+        from array import array
+        import asyncio
+
+        def frame(amplitude):
+            return array('h', [amplitude] * 320).tobytes()
+
+        class Microphone:
+            async def frames(self):
+                for pcm in [frame(1000)] * 9 + [frame(0)] * 11:
+                    yield pcm
+
+        class CloudStt:
+            def __init__(self):
+                self.starts = 0
+                self.turn = None
+                self.finished = asyncio.Event()
+                self.audio = bytearray()
+            async def start_turn(self, turn):
+                self.starts += 1
+                self.turn = turn
+            async def send_audio(self, pcm):
+                self.audio.extend(pcm)
+            async def finish_turn(self):
+                self.finished.set()
+            async def results(self):
+                await self.finished.wait()
+                yield Transcript(self.turn, "Athena, what time is it", True, 1.0)
+
+        class LocalWake:
+            def __init__(self):
+                self.audio = b""
+            async def transcribe_once(self, pcm):
+                self.audio = pcm
+                return "Athena, what time is it"
+
+        settings = MagicMock()
+        settings.get.side_effect = {
+            'vad_minimum_rms': 500,
+            'vad_noise_multiplier': 2.0,
+            'vad_end_silence_ms': 220,
+            'vad_start_ms': None,
+            'vad_minimum_speech_ms': None,
+        }.get
+        cloud = CloudStt()
+        local = LocalWake()
+        coordinator = VoiceCoordinator(
+            Microphone(), MagicMock(), cloud, MagicMock(), MagicMock(), MagicMock(),
+            VoiceGate(minimum_rms=500, noise_multiplier=2, end_silence_ms=220),
+            settings, local_wake_stt=local,
+        )
+        coordinator.wake_word = "athena"
+        coordinator.background.is_confirmation_reply = MagicMock(return_value=False)
+        turn = uuid4()
+        coordinator.active_turn = turn
+        self.assertEqual(await coordinator._listen(turn), "Athena, what time is it")
+        self.assertGreater(len(local.audio), 0)
+        self.assertEqual(cloud.starts, 1)
+        self.assertEqual(cloud.audio, local.audio)
+
+    async def test_local_wake_gate_discards_background_without_qwen(self):
+        from array import array
+
+        def frame(amplitude):
+            return array('h', [amplitude] * 320).tobytes()
+
+        class Microphone:
+            async def frames(self):
+                for pcm in [frame(1000)] * 9 + [frame(0)] * 11:
+                    yield pcm
+
+        local = MagicMock()
+        local.transcribe_once = AsyncMock(return_value="the room is quiet")
+        cloud = MagicMock()
+        cloud.start_turn = AsyncMock()
+        settings = MagicMock()
+        settings.get.side_effect = {
+            'vad_minimum_rms': 500,
+            'vad_noise_multiplier': 2.0,
+            'vad_end_silence_ms': 220,
+        }.get
+        coordinator = VoiceCoordinator(
+            Microphone(), MagicMock(), cloud, MagicMock(), MagicMock(), MagicMock(),
+            VoiceGate(minimum_rms=500, noise_multiplier=2, end_silence_ms=220),
+            settings, local_wake_stt=local,
+        )
+        coordinator.wake_word = "athena"
+        coordinator.background.is_confirmation_reply = MagicMock(return_value=False)
+        coordinator.active_turn = uuid4()
+        self.assertEqual(await coordinator._listen(coordinator.active_turn), "")
+        cloud.start_turn.assert_not_awaited()
 
     async def test_short_confirmation_requires_real_pending_state_and_voice_activation(self):
         gate = VoiceGate()

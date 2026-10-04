@@ -107,6 +107,7 @@ class CodingWorkspaceTool:
                         return ToolResult(False, "The file or project size limit would be exceeded.")
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(content, encoding="utf-8")
+                    self.last_artifact = str(path)
                     return ToolResult(True, "I saved the program file; it has not been tested yet.", {"path": str(path), "bytes": len(content.encode()), "tested": False})
                 if action not in {"check", "test", "run"}:
                     return ToolResult(False, "Unsupported coding action.")

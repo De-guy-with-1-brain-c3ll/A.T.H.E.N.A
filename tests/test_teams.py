@@ -169,7 +169,7 @@ class TeamsDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         import os
         from athena.tools import teams
         captured = io.StringIO()
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, {}, clear=True), patch.object(teams, "load_local_environment"):
             with contextlib.redirect_stdout(captured):
                 code = await teams.diagnose()
         self.assertEqual(code, 1)

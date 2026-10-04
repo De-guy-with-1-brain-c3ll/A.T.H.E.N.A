@@ -109,3 +109,95 @@ class CarryOverIsolationTests(unittest.TestCase):
         self.assertTrue(model._last_tools)
         fork = model.fork()
         self.assertEqual(fork._last_tools, set())
+
+
+class WebSearchOnItsOwnTests(unittest.TestCase):
+    """ATHENA has to look things up without being told to.
+
+    Tools were chosen by matching topic nouns — "web", "news", "latest" — so a
+    plain question reached the model with no way to check anything. It either
+    refused or answered from memory that might be years out of date, and the
+    only way to make it search was to say "look it up" yourself. Needing to be
+    told is the failure being fixed here.
+    """
+
+    def setUp(self):
+        self.model = model_with(TEAMS)
+
+    def _selected(self, text):
+        return self.model._tool_names_for(text)
+
+    def test_a_question_with_no_web_word_still_gets_the_web(self):
+        for question in ("who won the world cup in 2022",
+                         "how tall is mount fuji",
+                         "what is the capital of mongolia",
+                         "when was the iphone 17 released",
+                         "who is the prime minister of japan",
+                         "how far is mars from earth",
+                         "why is the sky blue",
+                         "is mount everest still growing",
+                         "who wrote hamlet"):
+            with self.subTest(question=question):
+                self.assertIn("search_web", self._selected(question),
+                              f"{question!r} left the model unable to check")
+
+    def test_a_question_with_no_verb_at_all_still_gets_the_web(self):
+        # Spoken questions often arrive as bare statements: no question word, no
+        # verb, no question mark. These used to select nothing whatsoever.
+        for question in ("distance to mars", "the iphone 17 release date"):
+            with self.subTest(question=question):
+                self.assertIn("search_web", self._selected(question),
+                              f"{question!r} read as a command, not a question")
+
+    def test_asking_for_research_explicitly_still_works(self):
+        for phrase in ("look it up", "google that", "find out for me",
+                       "search for it", "research that", "check that online"):
+            with self.subTest(phrase=phrase):
+                self.assertIn("search_web", self._selected(phrase))
+
+    def test_what_athena_can_answer_itself_does_not_go_to_the_web(self):
+        # Searching for the time or the weather is not just wasted, it is slower
+        # and less accurate than reading the clock that is already injected.
+        for local in ("what time is it", "what is the weather"):
+            with self.subTest(phrase=local):
+                self.assertNotIn("search_web", self._selected(local))
+
+    def test_its_own_commands_are_not_read_as_questions(self):
+        for command in ("set an alarm for 7", "play some music", "go to sleep",
+                        "tell me a joke", "stop", "cancel that"):
+            with self.subTest(command=command):
+                self.assertNotIn("search_web", self._selected(command),
+                                 f"{command!r} was mistaken for a question")
+
+    def test_chit_chat_is_not_read_as_a_question(self):
+        # "Hello" is a short utterance with no verb, which is exactly the shape
+        # of "distance to mars". The difference is that a greeting names nothing.
+        for greeting in ("hello", "hi", "hey", "good morning", "how are you",
+                         "thanks", "never mind", "nothing", "okay"):
+            with self.subTest(greeting=greeting):
+                self.assertNotIn("search_web", self._selected(greeting),
+                                 f"{greeting!r} was mistaken for a question")
+
+    def test_a_question_about_itself_is_not_a_question_about_the_world(self):
+        # "What tools do you have" is answered from a built-in list without any
+        # model call, so handing it a web search would be slower and worse.
+        for question in ("what tools do you have", "what can you do",
+                         "who are you", "what are your abilities"):
+            with self.subTest(question=question):
+                self.assertNotIn("search_web", self._selected(question))
+
+    def test_offering_the_web_never_cancels_the_previous_turn(self):
+        # The web tools ride along with whatever the turn is about. If they
+        # became a *topic*, a bare "yes" would look like a new subject and drop
+        # the channel reader the follow-up still needed.
+        self._selected("pull all the cjs")
+        for follow_up in ("yes", "pull them", "are you pulling them", "that"):
+            with self.subTest(follow_up=follow_up):
+                self.assertIn("teams_channel_posts", self._selected(follow_up),
+                              f"{follow_up!r} lost the previous turn's tools")
+
+    def test_the_web_tools_are_not_carried_into_the_next_turn(self):
+        # They are a capability for the turn that needs them, not a topic, so
+        # they must not linger and make every later turn look web-shaped.
+        self._selected("who won the world cup in 2022")
+        self.assertEqual(self._selected("set an alarm for 7"), {"set_alarm"})

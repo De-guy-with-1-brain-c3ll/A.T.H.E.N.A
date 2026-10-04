@@ -6,12 +6,31 @@ from unittest.mock import patch
 
 from athena.memory.database import MemoryDatabase, StoredTurn
 from athena.prompts import packaged_prompt_path, read_prompt, write_prompt
-from athena.web import DashboardState, _authenticated, _is_local, index
+from athena.web import (
+    VOICE_SERVICE,
+    WEB_RESTART_DELAY,
+    WEB_SERVICE,
+    DashboardState,
+    _authenticated,
+    _is_local,
+    _schedule_web_restart,
+    _service_action,
+    _systemctl,
+    index,
+)
 from athena.web_auth import COOKIE, SessionAuth, auth_disabled
 from uuid import uuid4
 
 
 class WebDashboardTests(unittest.TestCase):
+    def test_control_panel_has_a_dedicated_athena_restart_button(self):
+        page = (Path(__file__).parents[1] / "src" / "athena" / "web_static" / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('id="restartAthena"', page)
+        self.assertIn('data-service="restart"', page)
+        self.assertIn(">Restart ATHENA<", page)
+
     def test_dashboard_accepts_only_local_addresses(self):
         self.assertTrue(_is_local("127.0.0.1"))
         self.assertTrue(_is_local("192.168.31.10"))
@@ -161,6 +180,98 @@ class DashboardPasswordOffPageLoadTests(unittest.IsolatedAsyncioTestCase):
                                  b"a sufficiently long dashboard test secret")
         response = await index(_FakeRequest(state))
         self.assertIsNone(response.cookies.get(COOKIE))
+
+
+class ServiceControlTests(unittest.IsolatedAsyncioTestCase):
+    """Restarting "everything" must also restart the dashboard that asks.
+
+    athena-web cannot survive the request that restarts it, so the web half has
+    to be detached and delayed. These tests pin that down: the voice half is
+    awaited, and the web half is deliberately not.
+    """
+
+    async def test_a_plain_restart_only_touches_voice(self):
+        calls = []
+
+        async def fake_systemctl(*arguments, timeout=None):
+            calls.append(list(arguments))
+            return ""
+
+        async def fake_status(service=VOICE_SERVICE):
+            return "active"
+
+        with patch("athena.web._systemctl", fake_systemctl), \
+             patch("athena.web._service_status", fake_status):
+            status, label = await _service_action("restart")
+
+        self.assertEqual(calls, [["restart", VOICE_SERVICE]])
+        self.assertEqual(status, "active")
+        self.assertIn("running", label)
+
+    async def test_restart_all_restarts_voice_then_detaches_the_dashboard(self):
+        calls = []
+        created = []
+
+        async def fake_systemctl(*arguments, timeout=None):
+            calls.append(list(arguments))
+            return ""
+
+        async def fake_status(service=VOICE_SERVICE):
+            return "active"
+
+        def fake_create_task(coroutine):
+            created.append(coroutine)
+            coroutine.close()
+            return None
+
+        with patch("athena.web._systemctl", fake_systemctl), \
+             patch("athena.web._service_status", fake_status), \
+             patch("athena.web.asyncio.create_task", fake_create_task):
+            status, label = await _service_action("restart", everything=True)
+
+        self.assertEqual(calls, [["restart", VOICE_SERVICE], ['restart', 'athena-feishu.service']])
+        self.assertEqual(len(created), 1, "the web restart must be detached, not awaited")
+        self.assertIn("restarting", label.lower())
+
+    async def test_the_detached_web_restart_uses_no_block(self):
+        calls = []
+        delays = []
+
+        async def fake_sleep(seconds):
+            delays.append(seconds)
+
+        async def fake_exec(*arguments, **kwargs):
+            calls.append(list(arguments))
+
+            class Done:
+                returncode = 0
+
+            return Done()
+
+        with patch("athena.web.asyncio.sleep", fake_sleep), \
+             patch("athena.web.asyncio.create_subprocess_exec", fake_exec):
+            await _schedule_web_restart()
+
+        self.assertEqual(delays, [WEB_RESTART_DELAY])
+        self.assertEqual(
+            calls, [["sudo", "-n", "/usr/bin/systemctl", "restart", "--no-block", WEB_SERVICE]]
+        )
+
+    async def test_a_failing_systemctl_surfaces_its_stderr(self):
+        class Failed:
+            returncode = 1
+
+            async def communicate(self):
+                return b"", b"sudo: a password is required"
+
+        async def fake_exec(*arguments, **kwargs):
+            return Failed()
+
+        with patch("athena.web.asyncio.create_subprocess_exec", fake_exec):
+            with self.assertRaises(RuntimeError) as caught:
+                await _systemctl("restart", VOICE_SERVICE)
+
+        self.assertIn("password is required", str(caught.exception))
 
 
 if __name__ == "__main__":

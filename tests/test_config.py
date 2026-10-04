@@ -33,6 +33,22 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((result.stt_model, result.tts_model, result.deepseek_model),
                          ("custom-stt", "custom-tts", "custom-llm"))
 
+    def test_qwen_voice_provider_keeps_deepseek_for_other_work(self):
+        values = {
+            "DASHSCOPE_API_KEY": "speech",
+            "DEEPSEEK_API_KEY": "language",
+            "DEEPSEEK_MODEL": "deepseek-model",
+            "ATHENA_VOICE_LLM_PROVIDER": "qwen",
+            "ATHENA_VOICE_LLM_MODEL": "qwen-turbo",
+        }
+        with patch.dict(os.environ, values, clear=False):
+            result = Settings.from_environment()
+        self.assertEqual(result.deepseek_model, "deepseek-model")
+        self.assertEqual(result.voice_llm_model, "qwen-turbo")
+        self.assertEqual(result.voice_llm_api_key, "speech")
+        self.assertEqual(result.voice_llm_base_url,
+                         "https://dashscope.aliyuncs.com/compatible-mode/v1")
+
 
 if __name__ == "__main__":
     unittest.main()

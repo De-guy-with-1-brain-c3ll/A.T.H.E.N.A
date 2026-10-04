@@ -99,18 +99,38 @@ class Speaker:
             output_device_index=index,
         )
 
-    async def play(self, pcm: bytes) -> None:
+    @property
+    def music_format(self) -> tuple[int, int]:
+        """What music should be decoded to for this device.
+
+        The PortAudio stream below is opened once at a fixed rate and channel
+        count, so the decoder is told to match it rather than the other way
+        round. The USB device would accept 48 kHz stereo, but the stream is
+        mono here, and re-opening it mid-track to change that would be a much
+        larger change than the sound quality of the board's own little speaker
+        justifies.
+        """
+        return self._sample_rate, 1
+
+    async def play(self, pcm: bytes, rate: int | None = None,
+                   channels: int | None = None) -> None:
+        # A remote speaker can switch format per packet and uses those
+        # arguments; this stream cannot, and is already opened at the format
+        # that `music_format` reports.
         if self._stream is not None:
             pcm = self._apply_volume(pcm)
             # PortAudio streams are not safe for concurrent writes. TTS and
             # background music share this stream, so serialize every write.
-            async with self._write_lock:
-                write = asyncio.create_task(asyncio.to_thread(self._stream.write, pcm))
-                try:
-                    await asyncio.shield(write)
-                except asyncio.CancelledError:
-                    await asyncio.gather(write, return_exceptions=True)
-                    raise
+            packet_bytes = max(2, self._sample_rate // 10 * 2)
+            for offset in range(0, len(pcm), packet_bytes):
+                async with self._write_lock:
+                    write = asyncio.create_task(asyncio.to_thread(
+                        self._stream.write, pcm[offset:offset + packet_bytes]))
+                    try:
+                        await asyncio.shield(write)
+                    except asyncio.CancelledError:
+                        await asyncio.gather(write, return_exceptions=True)
+                        raise
 
     async def stop(self) -> None:
         if self._stream is not None:
@@ -120,8 +140,13 @@ class Speaker:
             # the event loop froze with it. Pa_AbortStream discards whatever
             # is queued immediately — and since abort and restart are both
             # blocking PortAudio calls, they belong in a worker thread.
-            await asyncio.to_thread(stream.abort_stream)
-            await asyncio.to_thread(stream.start_stream)
+            def abort_and_restart():
+                # PyAudio exposes abort only on its low-level PortAudio binding.
+                pyaudio.pa.abort_stream(stream._stream)
+                stream._is_running = False
+                stream.start_stream()
+            async with self._write_lock:
+                await asyncio.to_thread(abort_and_restart)
 
     async def close(self) -> None:
         if self._stream is not None:

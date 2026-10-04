@@ -1,5 +1,6 @@
 """Browser audio over the local network: framing, the bridge, and the dashboard."""
 import asyncio
+import json
 import socket
 from pathlib import Path
 import tempfile
@@ -18,6 +19,7 @@ from athena.remote_audio import (
 )
 from athena.voice_ipc import (
     AUDIO_FRAME,
+    CONTROL_FRAME,
     FLUSH_FRAME,
     VOICE_OFFLINE,
     VoiceAudioServer,
@@ -64,12 +66,18 @@ class FakeSink:
         self.closed = False
         self.binary = []
         self.controls = []
+        # One ordered log as well: the browser has to be told the shape of the
+        # stream *before* the audio it describes arrives, and two separate
+        # lists cannot show that.
+        self.events = []
 
     async def send_bytes(self, pcm):
         self.binary.append(pcm)
+        self.events.append(("audio", len(pcm)))
 
     async def send_json(self, payload):
         self.controls.append(payload)
+        self.events.append(("control", payload.get("type")))
 
 
 class RemoteAudioTests(unittest.IsolatedAsyncioTestCase):
@@ -107,8 +115,68 @@ class RemoteAudioTests(unittest.IsolatedAsyncioTestCase):
         await speaker.play(b"\x00\x01" * 10)
         await speaker.stop()
         self.assertEqual(sink.binary, [b"\x00\x01" * 10])
-        self.assertEqual(sink.controls, [{"type": "flush"}])
+        # Speech the browser is saying itself is not on this side of the socket,
+        # so an interruption has to cancel that as well as flush the PCM queue.
+        self.assertEqual(sink.controls, [
+            {"type": "audio_format", "rate": 24_000, "channels": 1},
+            {"type": "speak_stop"},
+            {"type": "flush"},
+        ])
+        # The format reaches the browser before the audio that needs it.
+        self.assertEqual(sink.events, [("control", "audio_format"),
+                                       ("audio", 20),
+                                       ("control", "speak_stop"),
+                                       ("control", "flush")])
         self.assertEqual(speaker._sample_rate, 24000)
+
+    async def test_music_is_sent_full_rate_and_in_stereo(self):
+        """The whole point of the change: music is no longer mono at 24 kHz."""
+        audio = RemoteAudio()
+        sink = FakeSink()
+        audio.attach(sink)
+        speaker = BrowserSpeaker(audio)
+        rate, channels = speaker.music_format
+        self.assertEqual((rate, channels), (48_000, 2))
+        await speaker.play(b"\x00\x00" * (rate * channels), rate=rate, channels=channels)
+        self.assertEqual(sink.controls[0], {"type": "audio_format",
+                                            "rate": 48_000, "channels": 2})
+
+    async def test_speech_after_music_is_announced_again(self):
+        """Otherwise a 24 kHz reply would be read at 48 kHz and sound sped up."""
+        audio = RemoteAudio()
+        sink = FakeSink()
+        audio.attach(sink)
+        speaker = BrowserSpeaker(audio)
+        await speaker.play(b"\x00\x00" * 4800, rate=48_000, channels=2)
+        await speaker.play(b"\x00\x00" * 4800)
+        self.assertEqual([control["type"] for control in sink.controls],
+                         ["audio_format", "audio_format"])
+        self.assertEqual(sink.controls[1], {"type": "audio_format",
+                                            "rate": 24_000, "channels": 1})
+
+    async def test_a_new_browser_is_told_the_format_again(self):
+        """A reconnected page starts from its defaults, not from the last one's."""
+        audio = RemoteAudio()
+        first = FakeSink()
+        audio.attach(first)
+        speaker = BrowserSpeaker(audio)
+        await speaker.play(b"\x00\x00" * 4800)
+        audio.detach(first)
+        second = FakeSink()
+        audio.attach(second)
+        await speaker.play(b"\x00\x00" * 4800)
+        self.assertEqual(len(first.controls), 1)
+        self.assertEqual(len(second.controls), 1)
+
+    async def test_the_format_is_not_repeated_within_one_stream(self):
+        audio = RemoteAudio()
+        sink = FakeSink()
+        audio.attach(sink)
+        speaker = BrowserSpeaker(audio)
+        for _ in range(5):
+            await speaker.play(b"\x00\x00" * 4800)
+        self.assertEqual(len(sink.controls), 1)
+        self.assertEqual(len(sink.binary), 5)
 
     async def test_browser_speaker_paces_successive_packets(self):
         """A websocket write is instant; browser playback is not."""
@@ -130,6 +198,23 @@ class RemoteAudioTests(unittest.IsolatedAsyncioTestCase):
         await speaker.stop()
         await speaker.close()
 
+    async def test_capabilities_are_recorded_and_forgotten_with_the_browser(self):
+        """What the page can do must not outlive the page that said it."""
+        audio = RemoteAudio()
+        sink = FakeSink()
+        self.assertFalse(audio.browser_speech)
+        audio.attach(sink)
+        audio.control({"type": "capabilities", "speech": True})
+        self.assertTrue(audio.browser_speech)
+        audio.detach(sink)
+        self.assertFalse(audio.browser_speech)
+
+    async def test_junk_control_messages_are_ignored(self):
+        audio = RemoteAudio()
+        for payload in (None, [], "nonsense", {}, {"type": "unknown"}):
+            audio.control(payload)
+        self.assertFalse(audio.browser_speech)
+
     async def test_detaching_only_clears_the_matching_sink(self):
         audio = RemoteAudio()
         first, second = FakeSink(), FakeSink()
@@ -148,6 +233,70 @@ class RemoteAudioTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(audio.attached)
         await audio.send(b"\x00" * 10)  # must not raise or queue anything
         self.assertEqual(sink.binary, [])
+
+
+class BrowserSpeechOffloadTests(unittest.IsolatedAsyncioTestCase):
+    """The connected computer can speak replies so the board does not have to.
+
+    It is only ever used on the browser's own say-so: nothing is assumed of a
+    page that has not introduced itself, so the board's normal voice is the
+    fallback rather than the other way round.
+    """
+
+    def _speaker(self):
+        audio = RemoteAudio()
+        sink = FakeSink()
+        audio.attach(sink)
+        return audio, sink, BrowserSpeaker(audio)
+
+    async def _wait_for_control(self, sink):
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if sink.controls:
+                return
+        self.fail("the browser was never asked to speak")
+
+    async def test_a_silent_browser_is_not_asked_to_speak(self):
+        _, sink, speaker = self._speaker()
+        self.assertFalse(speaker.can_speak_text)
+        self.assertFalse(await speaker.speak_text("hello"))
+        self.assertEqual(sink.controls, [])
+
+    async def test_declaring_the_capability_enables_the_offload(self):
+        audio, _, speaker = self._speaker()
+        audio.control({"type": "capabilities", "speech": True})
+        self.assertTrue(speaker.can_speak_text)
+
+    async def test_speaking_waits_for_the_browser_to_finish(self):
+        """The turn must stay open until the sound really stops."""
+        audio, sink, speaker = self._speaker()
+        audio.control({"type": "capabilities", "speech": True})
+        task = asyncio.create_task(speaker.speak_text("a reply"))
+        await self._wait_for_control(sink)
+        self.assertEqual(sink.controls[0], {"type": "speak", "text": "a reply"})
+        self.assertFalse(task.done(), "the turn closed before the sound stopped")
+        audio.control({"type": "speak_done"})
+        self.assertTrue(await asyncio.wait_for(task, 2))
+
+    async def test_a_browser_that_vanishes_does_not_hang_the_turn(self):
+        audio, sink, speaker = self._speaker()
+        audio.control({"type": "capabilities", "speech": True})
+        task = asyncio.create_task(speaker.speak_text("a reply"))
+        await self._wait_for_control(sink)
+        audio.detach(sink)
+        self.assertFalse(await asyncio.wait_for(task, 2))
+
+    async def test_a_browser_that_never_reports_back_is_stopped(self):
+        audio, sink, speaker = self._speaker()
+        audio.control({"type": "capabilities", "speech": True})
+        self.assertFalse(await speaker.speak_text("a reply", timeout=0.05))
+        self.assertIn({"type": "speak_stop"}, sink.controls)
+
+    async def test_interrupting_also_stops_browser_speech(self):
+        audio, sink, speaker = self._speaker()
+        audio.control({"type": "capabilities", "speech": True})
+        await speaker.stop()
+        self.assertIn({"type": "speak_stop"}, sink.controls)
 
 
 class FramingTests(unittest.IsolatedAsyncioTestCase):
@@ -197,6 +346,42 @@ class VoiceAudioBridgeTests(unittest.IsolatedAsyncioTestCase):
             await self.audio.flush()
             frame_type, _ = await asyncio.wait_for(read_frame(reader), 2)
             self.assertEqual(frame_type, FLUSH_FRAME)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+
+    async def test_a_capability_message_crosses_the_bridge(self):
+        """What the page can do has to reach the voice process, not stop at the socket."""
+        reader, writer = await self.harness.connect()
+        try:
+            writer.write(pack_frame(CONTROL_FRAME, json.dumps(
+                {"type": "capabilities", "speech": True}).encode("utf-8")))
+            await writer.drain()
+            for _ in range(80):
+                await asyncio.sleep(0.02)
+                if self.audio.browser_speech:
+                    break
+            self.assertTrue(self.audio.browser_speech)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+
+    async def test_the_audio_format_is_relayed_as_control(self):
+        """The browser learns the shape of the stream before it receives it."""
+        reader, writer = await self.harness.connect()
+        try:
+            await self.audio.send_json({"type": "audio_format", "rate": 48_000,
+                                        "channels": 2})
+            frame_type, payload = await asyncio.wait_for(read_frame(reader), 2)
+            self.assertEqual(frame_type, CONTROL_FRAME)
+            self.assertEqual(json.loads(payload),
+                             {"type": "audio_format", "rate": 48_000, "channels": 2})
         finally:
             writer.close()
             try:
@@ -422,6 +607,7 @@ class DashboardAudioRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ready["type"], "ready")
         self.assertEqual(ready["microphone_rate"], 16000)
         self.assertEqual(ready["speaker_rate"], 24000)
+        self.assertEqual(ready["speaker_channels"], 1)
 
         await socket.send_bytes(b"\x11\x22" * 20)
         self.assertEqual(await asyncio.wait_for(self.audio.next_audio(), 3), b"\x11\x22" * 20)

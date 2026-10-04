@@ -31,3 +31,32 @@
   cursor: pointer;
 }
 .music-message { font-size: 12px; min-height: 36px; margin: 8px 0 0; }
+.playlist-block { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 14px; }
+.playlist-list { display: grid; gap: 7px; margin-top: 10px; }
+.playlist-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 7px;
+}
+.playlist-info { display: grid; gap: 2px; min-width: 0; }
+.playlist-name { font-size: 13px; font-weight: 650; overflow-wrap: anywhere; }
+.playlist-tags {
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.playlist-row button { padding: 7px 10px; font-size: 12px; }
+.playlist-form { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 12px; }
+.playlist-form input:nth-child(3) { grid-column: span 2; }
+.playlist-form button { grid-column: span 2; padding: 9px 7px; }
+.playlist-form input {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+}

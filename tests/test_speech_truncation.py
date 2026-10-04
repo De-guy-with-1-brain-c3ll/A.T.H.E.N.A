@@ -68,6 +68,40 @@ def coordinator_with(tts, synth_timeout: float = 1.0):
 
 
 class LongSpeechIsNotTruncatedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_streamed_replies_use_the_browser_voice_without_cloud_tts(self):
+        from unittest.mock import AsyncMock
+        from uuid import uuid4
+        c = coordinator_with(FakeTts(3))
+        c.speech_budget = 0
+        c.speaker.can_speak_text = True
+        c.speaker.speak_text = AsyncMock(return_value=True)
+        c.tts.send_text = AsyncMock()
+        c.memory = SimpleNamespace(remember_turn=AsyncMock())
+        turn = uuid4(); c.active_turn = turn
+        async def fragments():
+            yield "Google is open. "
+            yield "What would you like to do?"
+        await c._answer_stream(turn, "open google", fragments())
+        self.assertEqual(c.speaker.bytes, 0)
+        self.assertGreater(c.speaker.speak_text.await_count, 0)
+        self.assertIn("Google is open", " ".join(call.args[0] for call in c.speaker.speak_text.await_args_list))
+        c.tts.send_text.assert_not_awaited()
+        c.memory.remember_turn.assert_awaited_once()
+
+    async def test_streamed_browser_failure_falls_back_to_pcm(self):
+        from unittest.mock import AsyncMock
+        from uuid import uuid4
+        c = coordinator_with(FakeTts(1))
+        c.speech_budget = 0
+        c.speaker.can_speak_text = True
+        c.speaker.speak_text = AsyncMock(return_value=False)
+        c.memory = SimpleNamespace(remember_turn=AsyncMock())
+        turn = uuid4(); c.active_turn = turn
+        async def fragments():
+            yield "This answer must still be spoken."
+        await c._answer_stream(turn, "hello", fragments())
+        self.assertEqual(c.speaker.bytes, BYTES_PER_SECOND)
+
     async def test_a_roundup_longer_than_the_synthesis_clock_is_played_in_full(self):
         """Forty seconds of speech through the background-result path."""
         tts = FakeTts(40.0, realtime=True)
@@ -94,6 +128,54 @@ class LongSpeechIsNotTruncatedTests(unittest.IsolatedAsyncioTestCase):
         coordinator = coordinator_with(tts)
         await coordinator._speak_text("short")
         self.assertTrue(tts.cancelled, "the synthesis session was not released")
+
+
+class SpeakingOnTheComputerTests(unittest.IsolatedAsyncioTestCase):
+    """A connected computer that can speak is used instead of the board.
+
+    This is the offload: for as long as such a browser is attached there is no
+    synthesis, no decoding and no pacing on the Pi, and nothing billed.
+    """
+
+    class SpeakingSpeaker:
+        def __init__(self, capable: bool):
+            self.can_speak_text = capable
+            self.bytes = 0
+            self.said = []
+
+        async def play(self, pcm):
+            self.bytes += len(pcm)
+
+        async def speak_text(self, text, timeout=120.0):
+            self.said.append(text)
+            return True
+
+    async def test_a_capable_computer_speaks_the_reply_instead_of_the_board(self):
+        coordinator = coordinator_with(FakeTts(5.0))
+        coordinator.speaker = self.SpeakingSpeaker(True)
+        await coordinator._speak_text("hello there")
+        self.assertEqual(coordinator.speaker.said, ["hello there"])
+        self.assertEqual(coordinator.speaker.bytes, 0,
+                         "the board synthesized even though the computer could speak")
+
+    async def test_the_board_still_speaks_when_the_computer_cannot(self):
+        coordinator = coordinator_with(FakeTts(3.0))
+        coordinator.speaker = self.SpeakingSpeaker(False)
+        await coordinator._speak_text("short")
+        self.assertEqual(coordinator.speaker.said, [])
+        self.assertEqual(coordinator.speaker.bytes, int(3.0 * BYTES_PER_SECOND))
+
+    async def test_a_speaker_with_no_opinion_keeps_the_old_path(self):
+        """FakeSpeaker predates the capability and must be unaffected."""
+        coordinator = coordinator_with(FakeTts(2.0))
+        await coordinator._speak_text("short")
+        self.assertEqual(coordinator.speaker.bytes, int(2.0 * BYTES_PER_SECOND))
+
+    async def test_the_turn_is_released_after_the_computer_speaks(self):
+        coordinator = coordinator_with(FakeTts(3.0))
+        coordinator.speaker = self.SpeakingSpeaker(True)
+        await coordinator._speak_text("hello")
+        self.assertEqual(coordinator.state, AgentState.IDLE)
 
 
 class PlaybackReportsWhatItPlayedTests(unittest.IsolatedAsyncioTestCase):

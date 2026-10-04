@@ -9,12 +9,29 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 import zipfile
 
 
 def signing_payload(manifest: dict) -> bytes:
-    return (f"{manifest['schema']}\n{manifest['version']}\n{manifest['archive']}\n"
-            f"{manifest['sha256']}\n{manifest['bytes']}\n").encode()
+    # The sequence is signed too: without it a captured old (still validly
+    # signed) manifest could be replayed to roll the Pi back.
+    return (f"{manifest['schema']}\n{manifest['sequence']}\n{manifest['version']}\n"
+            f"{manifest['archive']}\n{manifest['sha256']}\n{manifest['bytes']}\n").encode()
+
+
+def next_sequence(feed: Path) -> int:
+    """A strictly increasing counter persisted with the feed."""
+    state = feed / ".feed-state.json"
+    previous = 0
+    if state.is_file():
+        try:
+            previous = int(json.loads(state.read_text(encoding="utf-8")).get("sequence", 0))
+        except (OSError, ValueError, TypeError, AttributeError):
+            previous = 0
+    sequence = max(previous + 1, int(time.time()))
+    state.write_text(json.dumps({"sequence": sequence}) + "\n", encoding="utf-8")
+    return sequence
 
 
 def source_files(project_root: Path) -> list[Path]:
@@ -50,8 +67,9 @@ def build_release(project_root: Path, feed: Path, version: str, key: bytes) -> d
                            else path.read_bytes())
                 bundle.writestr(info, content)
         digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
-        manifest = {"schema": 1, "version": version, "archive": archive_name,
-                    "sha256": digest, "bytes": temporary.stat().st_size}
+        manifest = {"schema": 1, "sequence": next_sequence(feed), "version": version,
+                    "archive": archive_name, "sha256": digest,
+                    "bytes": temporary.stat().st_size}
         manifest["signature"] = hmac.new(key, signing_payload(manifest), hashlib.sha256).hexdigest()
         temporary.replace(archive)
         manifest_tmp = feed / "manifest.json.tmp"

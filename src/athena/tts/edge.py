@@ -50,9 +50,13 @@ from athena.events import AudioChunk
 # Edge's neural voices are 24 kHz mono, matching the cloud voice's rate.
 SAMPLE_RATE = 24_000
 
-# Aria is the default because it measured fastest to first audio (~1.0 s against
-# Andrew's 2.0 s) and is a neutral, natural read rather than a character voice.
-DEFAULT_VOICE = "en-US-AriaNeural"
+# Jenny is the default because it is the only voice measured here that is both
+# warm and as fast as the old neutral one. It is tagged "Friendly, Considerate,
+# Comfort" and reached first audio in ~890 ms, the same as Aria's ~900 ms, so the
+# warmth is free. Ava is the most expressive voice Edge offers ("Expressive,
+# Caring, Pleasant, Friendly") but costs roughly +430 ms to first audio, so it is
+# the choice to make deliberately rather than the default.
+DEFAULT_VOICE = "en-US-JennyNeural"
 
 # How much decoded PCM to hand over at a time, matching the other backends so the
 # speaker sees the same cadence regardless of which voice is configured.
@@ -105,6 +109,7 @@ def decoder_command(sample_rate: int | None = None) -> list[str]:
     rate = sample_rate or edge_sample_rate()
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "mp3", "-probesize", "32", "-analyzeduration", "0",
         "-i", "pipe:0",
         "-f", "s16le", "-acodec", "pcm_s16le",
         "-ar", str(rate), "-ac", "1",
@@ -296,6 +301,8 @@ class EdgeSynthesizer:
                 drain_task.cancel()
             if self._stderr_task is not None and not self._stderr_task.done():
                 self._stderr_task.cancel()
+            await asyncio.gather(*(task for task in (spawn, drain_task, self._stderr_task)
+                                   if task is not None), return_exceptions=True)
             if first_ms is not None:
                 self.last_first_byte_ms = first_ms
             self.last_total_ms = (loop.time() - started) * 1000
@@ -361,10 +368,16 @@ class EdgeSynthesizer:
         """
         loop = asyncio.get_running_loop()
         first: float | None = None
+        remainder = b""
         while True:
             pcm = await process.stdout.read(CHUNK_BYTES)
             if not pcm:
                 break
+            pcm = remainder + pcm
+            aligned = len(pcm) - len(pcm) % 2
+            pcm, remainder = pcm[:aligned], pcm[aligned:]
+            if not pcm:
+                continue
             if self._turn_id != turn_id:
                 # Superseded mid-reply: stop producing audio nobody will hear.
                 break

@@ -217,6 +217,10 @@ class QwenRealtimeSynthesizer:
         if session is not None:
             # append_text is a blocking websocket write on the first-audio path.
             await asyncio.to_thread(session.append_text, text)
+            from athena.metrics import record
+            await asyncio.to_thread(record, 'qwen_tts', {'characters': len(text),
+                'estimated_text_tokens': max(1, len(text.encode('utf-8')) // 4),
+                'note': 'Rough text estimate, not provider audio tokens or billing.'})
 
     async def audio(self, turn_id: UUID | None = None):
         turn_id = turn_id or self._turn_id

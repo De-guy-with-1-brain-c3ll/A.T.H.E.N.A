@@ -257,9 +257,79 @@ closed while this is enabled, so no sound hardware is needed. `Use Browser Audio
 in this folder does it for you and prints the address to open; `Use Pi Audio
 Instead.cmd` switches back.
 
-### 2. Open the dashboard on the device
+### Switching back and forth
 
-Open `http://PI_ADDRESS:8780`, sign in, and use **Microphone and speaker** on the
+Both directions are the same one-line setting plus a restart, and both helper
+scripts in this folder do it for you — there is nothing to edit by hand:
+
+| ATHENA should use | Run | What it sets |
+| --- | --- | --- |
+| The device showing the dashboard | `Use Browser Audio.cmd` | `ATHENA_REMOTE_AUDIO=1` — the Pi's own devices stay closed |
+| The Pi's own USB speaker and microphone | `Use Pi Audio Instead.cmd` | `ATHENA_REMOTE_AUDIO=0` — the Pi's ALSA devices are used |
+
+Both ask for the Pi's root password. After either one, reload the dashboard page.
+Then, under **Command → Microphone and speaker**, press **Start** for browser
+audio, or leave it alone for the Pi's own audio.
+
+While browser audio is on, **the Pi's own speaker is silent on purpose**. That is
+not a fault and nothing is broken: there is only ever one output, and it is the
+connected device. The Detected speech panel on the same card tells you what the
+voice service is actually receiving.
+
+To do it by hand instead of with a script: change `ATHENA_REMOTE_AUDIO` in
+`/etc/athena/athena.env`, then `sudo systemctl restart athena-voice.service`.
+
+### What runs on the Pi, and what runs on your computer
+
+Nothing is duplicated: each side does the part it is good at.
+
+| Work | Where it happens |
+| --- | --- |
+| Listening to the microphone (VAD, end-of-speech) | Pi |
+| Speech recognition | Cloud |
+| Thinking (the language model) | Cloud |
+| Speaking a reply out loud | **Your computer**, in its own voice |
+| Decoding and playing music | Pi decodes, your computer plays it at 48 kHz stereo |
+
+A reply is only spoken by your computer while the dashboard is attached and the
+page has said it can speak; if the browser is closed or cannot, the Pi falls back
+to its own voice with no configuration change. Music is sent at the full rate in
+stereo precisely because the far end is a real sound card rather than the small
+mono device on the board.
+
+### 2. Put the dashboard on HTTPS
+
+A browser only hands a page the microphone in a "secure context", and `http://`
+on a local-network address is not one. That is why **Start** fails with
+*"Microphone blocked: Cannot read properties of undefined (reading
+'getUserMedia')"* — and why music fails the same way, because the speaker
+attaches over the same socket. `http://localhost` is a secure context; a LAN
+address is not, which is why this only bites when the dashboard is opened from
+another device.
+
+Run `Use Dashboard HTTPS.cmd` in this folder. It generates a self-signed
+certificate covering the addresses this box answers on, switches the dashboard to
+HTTPS, restarts it, and health-checks it.
+
+Then trust that certificate once on every device that opens the dashboard. A
+certificate the browser refuses is *not* a secure context either, so the
+microphone stays blocked until it is trusted:
+
+- **Windows** — run `Trust Dashboard Certificate.cmd` as administrator, then close
+  and reopen the browser (Chrome and Edge read the trust store at start-up).
+- **Phone or tablet** — copy it off the Pi with
+  `scp root@PI_ADDRESS:/etc/athena/tls/dashboard.crt .` and install it as a
+  trusted root certificate.
+
+The certificate is pinned to this box's addresses. If DHCP hands it a new one,
+re-run `Use Dashboard HTTPS.cmd` with `--force` and trust the new certificate —
+or give the Pi a DHCP reservation and forget about it. Running the same file with
+`off` puts the dashboard back on plain HTTP and the microphone goes back to being
+blocked.
+
+### 3. Open the dashboard on the device
+
+Open `https://PI_ADDRESS:8780`, sign in, and use **Microphone and speaker** on the
 Command tab: press **Start** to hand ATHENA this device's microphone and speaker,
 and **Stop** to give them back.
 
@@ -268,15 +338,42 @@ the room is silent, the wrong input device is selected. Use headphones, otherwis
 the microphone hears ATHENA's own voice and the voice detector treats that as
 someone speaking.
 
+### Seeing what was heard
+
+The **Detected speech** panel under the buttons is the speech pipeline reporting
+on itself. It shows the live partial transcript as words are recognised, the last
+completed transcript, whether a turn is open, and — the part that matters when
+transcription looks wrong — how much audio was kept. `retained 3.40s in 170
+frames` is the audio the voice gate handed to the recogniser for the current
+turn, counted from the moment speech started; `dropped 0.00s` is audio the
+browser backlog threw away. Retention is lossless as long as `dropped` stays at
+zero, which is the normal case: the only bound is the 800 ms pre-roll window,
+and it can only ever reach back over silence, never over speech.
+
+Every time the end of speech is detected, ATHENA plays a short falling two-note
+blip. It is deliberately the mirror of the rising acknowledgement chirp, so
+"I heard you" and "I have stopped listening" are different sounds. Set
+`ATHENA_EOS_TONE=0` to turn it off.
+
+Both of these read one small file the voice service writes to `/run` — see
+`ATHENA_AUDIO_STATUS_PATH` in `config/athena.env.example`. The same data is on
+the console: `python -m athena.audio.telemetry` prints a live line.
+
 ### How it works
 
 ```text
 browser  --websocket-->  dashboard (:8780)  --local socket-->  voice service
 ```
 
-Audio never leaves the local network. The dashboard already refuses non-local
-addresses and requires its password, so the audio socket inherits both and no new
-port is opened. Speech recognition and synthesis still run in the cloud.
+With HTTPS on, that websocket is `wss://`; the dashboard picks the scheme from the
+page, so nothing else changes. Audio never leaves the local network. The dashboard
+already refuses non-local addresses and requires its password, so the audio socket
+inherits both and no new port is opened. Speech recognition and synthesis still
+run in the cloud.
+
+Music uses this same route. Once the dashboard says **Start**, asking ATHENA to
+play a song or one of your saved playlists plays through that computer's default
+audio output instead of the Pi speaker.
 
 ### Notes and limits
 
@@ -320,3 +417,18 @@ native 48 kHz formats and sends mono speech to both speaker channels.
   necessary; ATHENA's `read_webpage` and `search_web` tools remain available.
 - Use Ethernet when possible. Wi-Fi and cloud distance affect latency far more than the
   Pi's CPU does.
+# Voice optimization release .54
+
+Edge TTS and Qwen STT remain the primary providers. Install the small streaming
+wake model once with `python tools/install_keyword_model.py --help` on the
+development computer; copy its output directory to
+`/opt/athena/models/keyword` on the Pi. Keep `ATHENA_LOCAL_WAKE=1` and
+`ATHENA_WAKE_WORD=athena`. Idle room audio stays local; Qwen starts only after
+the keyword, or during the existing 20-second follow-up/approval window.
+The window restarts after the spoken reply ends. Existing custom prompts remain
+unchanged. The compact prompt applies only to the stock voice prompt.
+
+`tools/run_pi_qa.py --tests` runs safe regressions with the Pi's installed
+libraries. Live `--prompts` checks make eight bounded billed DeepSeek requests;
+the voice QA sends one short Qwen utterance. Do not run paid QA continuously.
+

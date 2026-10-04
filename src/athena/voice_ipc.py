@@ -9,6 +9,14 @@ from pathlib import Path
 
 SOCKET_PATH = Path(os.environ.get("ATHENA_VOICE_SOCKET", "/run/athena/voice-control.sock"))
 
+# Every music command the dashboard may drive: transport, the volume, and the
+# saved playlists. Kept here rather than in the web layer because this socket is
+# the one the voice process actually trusts.
+MUSIC_COMMANDS = frozenset({
+    "status", "toggle", "pause", "resume", "next", "stop", "volume",
+    "add_playlist", "remove_playlist", "play_playlist", "auto_play",
+})
+
 
 class VoiceControlServer:
     def __init__(self, coordinator, path: Path = SOCKET_PATH) -> None:
@@ -39,11 +47,19 @@ class VoiceControlServer:
                     response["error"] = "The ATHENA speaker queue is full."
             elif action == "music":
                 command = str(request.get("command", "")).strip()
-                if command not in {"status", "toggle", "pause", "resume", "next", "stop", "volume"}:
+                if command not in MUSIC_COMMANDS:
                     raise ValueError("Invalid music-control request.")
                 value = request.get("value")
                 value = int(value) if value is not None else None
-                response = {"ok": True, **await self.coordinator.control_music(command, value)}
+                name = request.get("name")
+                moods = request.get("moods")
+                if moods is not None and not isinstance(moods, list):
+                    raise ValueError("Invalid music-control request.")
+                response = {"ok": True, **await self.coordinator.control_music(
+                    command, value,
+                    name=str(name) if name is not None else None,
+                    query=str(request.get("query", "")),
+                    moods=[str(mood) for mood in moods] if moods else None)}
             elif action == "volume":
                 value = request.get("value")
                 if value is None:
@@ -51,6 +67,8 @@ class VoiceControlServer:
                 else:
                     response = {"ok": True,
                                 "volume": await self.coordinator.set_volume(int(value))}
+            elif action == "audio_route":
+                response = {"ok": True, **await self.coordinator.request_audio_route(request.get("target", "status"))}
             else:
                 raise ValueError("Invalid voice-control request.")
         except (ValueError, TypeError, RuntimeError, OSError, json.JSONDecodeError, asyncio.TimeoutError) as error:
@@ -70,12 +88,23 @@ class VoiceControlServer:
 async def request_speech(text: str, path: Path = SOCKET_PATH) -> None:
     await _request({"action": "speak", "text": text}, path)
 
+async def request_audio_route(target="status", path: Path = SOCKET_PATH) -> dict:
+    return await _request({"action": "audio_route", "target": target}, path)
 
-async def request_music(command: str, value: int | None = None,
+
+async def request_music(command: str, value: int | None = None, *,
+                        name: str | None = None, query: str = "",
+                        moods: list[str] | None = None,
                         path: Path = SOCKET_PATH) -> dict:
     payload: dict[str, object] = {"action": "music", "command": command}
     if value is not None:
         payload["value"] = value
+    if name is not None:
+        payload["name"] = name
+    if query:
+        payload["query"] = query
+    if moods:
+        payload["moods"] = list(moods)
     return await _request(payload, path)
 
 
@@ -102,7 +131,7 @@ async def _request(payload: dict, path: Path) -> dict:
         encoded = json.dumps(payload, separators=(",", ":"))
         writer.write(encoded.encode() + b"\n")
         await writer.drain()
-        raw = await asyncio.wait_for(reader.readline(), 3)
+        raw = await asyncio.wait_for(reader.readline(), 12 if payload.get("action") == "audio_route" else 3)
         response = json.loads(raw)
         if not response.get("ok"):
             raise RuntimeError(str(response.get("error") or "ATHENA rejected the speech request."))
@@ -125,6 +154,9 @@ AUDIO_SOCKET_PATH = Path(os.environ.get(
     "ATHENA_VOICE_AUDIO_SOCKET", "/run/athena/voice-audio.sock"))
 AUDIO_FRAME = 1
 FLUSH_FRAME = 2
+# Anything else the two sides need to say to each other — what the audio format
+# is about to be, and what the browser can do for itself — as JSON.
+CONTROL_FRAME = 3
 MAX_FRAME_BYTES = 1 << 20
 
 
@@ -158,7 +190,10 @@ class SocketSink:
     async def send_json(self, payload: dict) -> None:
         if payload.get("type") == "flush":
             self._writer.write(pack_frame(FLUSH_FRAME))
-            await self._writer.drain()
+        else:
+            self._writer.write(pack_frame(CONTROL_FRAME,
+                                          json.dumps(payload).encode("utf-8")))
+        await self._writer.drain()
 
 
 VOICE_OFFLINE = "ATHENA voice is offline. Start it before sharing this device's audio."
@@ -192,12 +227,19 @@ class VoiceAudioServer:
         self.audio.attach(sink)
         self.audio.drain()
         try:
+            if hasattr(self.audio, "selected_route"):
+                await self.audio.send_json({"type": "audio_route", "target": self.audio.selected_route})
             while True:
                 frame_type, payload = await read_frame(reader)
                 if frame_type == AUDIO_FRAME:
                     self.audio.push(payload)
                 elif frame_type == FLUSH_FRAME:
                     self.audio.drain()
+                elif frame_type == CONTROL_FRAME:
+                    try:
+                        self.audio.control(json.loads(payload or b"{}"))
+                    except ValueError:
+                        continue
         except (asyncio.IncompleteReadError, ConnectionResetError, ValueError, OSError):
             pass
         finally:

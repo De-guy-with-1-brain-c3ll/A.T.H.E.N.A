@@ -1,0 +1,22 @@
+[Unit]
+Description=ATHENA split-routing VPN (Mihomo)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/athena-vpn/config.yaml
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mihomo -d /var/lib/athena-vpn -f /etc/athena-vpn/config.yaml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/athena-vpn
+PrivateTmp=true
+UMask=0077
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

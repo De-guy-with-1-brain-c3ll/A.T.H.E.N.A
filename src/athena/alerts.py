@@ -437,6 +437,10 @@ class AlertScheduler:
             return sorted(self.watches.values(), key=lambda row: row.get("created_at", ""))
 
     async def start(self) -> None:
+        if getattr(self, 'agents', None):
+            await self.agents.start()
+        if getattr(self, "workflows", None):
+            await self.workflows.start()
         if self._task is None:
             self._task = asyncio.create_task(self._alarm_loop())
         if self.teams_graph is not None and self._teams_task is None:
@@ -445,6 +449,10 @@ class AlertScheduler:
             self._watch_task = asyncio.create_task(self._watch_loop())
 
     async def close(self) -> None:
+        if getattr(self, 'agents', None):
+            await self.agents.close()
+        if getattr(self, "workflows", None):
+            await self.workflows.close()
         tasks = [task for task in (self._task, self._teams_task, self._watch_task)
                  if task is not None]
         self._task = self._teams_task = self._watch_task = None

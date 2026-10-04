@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import os
-from urllib.parse import urlencode, urljoin
+import re
+from urllib.parse import urlencode, urljoin, urlsplit
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -70,40 +71,121 @@ class ReadWebpageTool:
 
 class SearchWebTool:
     definition = ToolDefinition(
-        name="search_web", description="Search the public web through Bing's RSS search. Returns source links and snippets, not verified full-page facts. Service availability varies; read source pages before relying on claims.",
+        name="search_web", description="Search the public web through Bing RSS; automatically tries a refined query when no sources pass filtering. Empty or irrelevant hits are not a finished answer: refine the topic/language/source and read promising pages. For Chinese news, use mainland sources and verify article dates before claiming today's events.",
         parameters={"type": "object", "properties": {
             "query": {"type": "string", "minLength": 2, "maxLength": 300},
             "limit": {"type": "integer", "minimum": 1, "maximum": 8, "default": 5},
         }, "required": ["query"], "additionalProperties": False}, timeout_seconds=20)
 
     def __init__(self, http=None):
-        self.http = http or PublicHTTP()
+        self.http = http or PublicHTTP(timeout=8)
+
+    # Search engines happily answer a query containing "today" with dictionary
+    # pages about the word today.  For news requests that is worse than an empty
+    # result: it makes the model sound current while giving it no current event.
+    # Keep this allow-list deliberately small and recognizable so a Chinese-news
+    # request cannot silently fall back to Baidu encyclopedia or a translation
+    # page.  The article itself is still read by the model as untrusted data.
+    CHINESE_NEWS_HOSTS = frozenset({
+        "news.sina.com.cn", "news.qq.com", "news.163.com", "news.sohu.com",
+        "www.chinanews.com.cn", "chinanews.com.cn", "www.people.com.cn",
+        "people.com.cn", "www.xinhuanet.com", "xinhuanet.com",
+        "www.thepaper.cn", "thepaper.cn", "www.caixin.com", "caixin.com",
+        "www.yicai.com", "yicai.com", "www.cctv.com", "cctv.com",
+        "www.cls.cn", "cls.cn", "news.ifeng.com", "ifeng.com",
+    })
+    NEWS_WORDS = re.compile(
+        r"\b(?:news|headlines|current affairs|breaking|latest|today)\b|"
+        r"新闻|资讯|时事|要闻|热点|头条|发生了什么|最新消息", re.I)
+    CHINESE_SOURCE_WORDS = re.compile(
+        r"\b(?:chinese|china|mainland|domestic)\b|中国|中文|大陆|国内|[\u4e00-\u9fff]", re.I)
+    IRRELEVANT_NEWS_WORDS = re.compile(
+        r"\b(?:dictionary|translation|translate|meaning|pronunciation|百科|词典|翻译)\b|"
+        r"百度百科|英语单词", re.I)
+
+    @classmethod
+    def _is_news_request(cls, query: str) -> bool:
+        return bool(cls.NEWS_WORDS.search(query))
+
+    @classmethod
+    def _is_chinese_news_request(cls, query: str) -> bool:
+        return cls._is_news_request(query) and bool(cls.CHINESE_SOURCE_WORDS.search(query))
+
+    @classmethod
+    def _keep_result(cls, item: dict, *, chinese_news: bool) -> bool:
+        title = str(item.get("title", ""))
+        snippet = str(item.get("snippet", ""))
+        if cls.IRRELEVANT_NEWS_WORDS.search(f"{title} {snippet}"):
+            return False
+        if not chinese_news:
+            return True
+        host = (urlsplit(str(item.get("url", ""))).hostname or "").lower().rstrip(".")
+        return host in cls.CHINESE_NEWS_HOSTS or any(host.endswith("." + root) for root in cls.CHINESE_NEWS_HOSTS)
+
+    @staticmethod
+    def _china_date() -> str:
+        # ATHENA is used in mainland China; using its local calendar day avoids
+        # asking for "today" at 23:30 and retrieving tomorrow's UTC headlines.
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        except Exception:
+            return datetime.now().astimezone().date().isoformat()
 
     async def execute(self, arguments):
         import xml.etree.ElementTree as ET
         try:
-            url = "https://www.bing.com/search?" + urlencode({"q": arguments["query"], "format": "rss"})
+            original_query = str(arguments["query"]).strip()
+            chinese_news = self._is_chinese_news_request(original_query)
+            query = original_query
+            if chinese_news and not arguments.get("_refined"):
+                # The date makes the request deterministic and prevents Bing's
+                # RSS endpoint from returning evergreen pages about "today".
+                query = f"{original_query} {self._china_date()} 中国 新闻"
+                sites = " OR ".join(f"site:{host}" for host in sorted(self.CHINESE_NEWS_HOSTS))
+                query = f"{query} ({sites})"
+            url = "https://www.bing.com/search?" + urlencode({"q": query, "format": "rss"})
             response = await self.http.get(url)
             # Reject DTD/entity-bearing documents rather than expanding untrusted XML.
             if b"<!DOCTYPE" in response.body.upper() or b"<!ENTITY" in response.body.upper():
                 raise PublicWebError("Unexpected XML declaration.")
             root = ET.fromstring(response.body)
-            results = []
+            raw_results = []
             for item in root.findall("./channel/item"):
                 link = item.findtext("link", "")
                 try:
                     validate_url(link)
                 except ValueError:
                     continue
-                results.append({"title": item.findtext("title", "")[:300], "url": link,
-                                "snippet": BeautifulSoup(item.findtext("description", ""), "html.parser").get_text(" ", strip=True)[:800]})
-                if len(results) >= arguments.get("limit", 5):
-                    break
-            return ToolResult(bool(results), "I found these sources." if results else "Search returned no usable results.",
-                              {"results": results, "source": url, "untrusted_content": True,
+                raw_results.append({"title": item.findtext("title", "")[:300], "url": link,
+                                    "snippet": BeautifulSoup(item.findtext("description", ""), "html.parser").get_text(" ", strip=True)[:800]})
+            results = [item for item in raw_results if self._keep_result(item, chinese_news=chinese_news)]
+            results = results[:arguments.get("limit", 5)]
+            if not results and not arguments.get("_refined"):
+                # One cheap deterministic refinement, not another paid model call.
+                # Remove the giant OR site list and use a focused source query.
+                if chinese_news:
+                    refined = f"{original_query} {self._china_date()} 新闻 site:news.qq.com"
+                else:
+                    refined = re.sub(r"\b(?:please|can you|could you|tell me|find me|search for|look up)\b", "", original_query, flags=re.I)
+                    refined = re.sub(r"\s+", " ", refined.replace('"', '')).strip()
+                    if refined == original_query:
+                        refined += " information"
+                retry = await self.execute({"query": refined[:300], "limit": arguments.get("limit", 5), "_refined": True})
+                return ToolResult(retry.success, retry.spoken_text, {**retry.data,
+                    "original_query": original_query, "attempted_queries": [query, refined[:300]]})
+            if chinese_news and not results:
+                message = "No usable Chinese-news sources found. Refine the topic or source; article dates still need verification."
+            else:
+                message = "I found Chinese-news sources; read them to verify dates and claims." if chinese_news else "I found these sources." if results else "No usable sources found. Refine the query or try a different source."
+            return ToolResult(bool(results), message,
+                              {"results": results, "source": url, "query": query,
+                               "news_request": self._is_news_request(original_query),
+                               "chinese_news_filter": chinese_news,
+                               "untrusted_content": True,
                                "retrieved_at": datetime.now(timezone.utc).isoformat()})
         except (ValueError, ET.ParseError, aiohttp.ClientError, TimeoutError):
-            return ToolResult(False, "Web search is unavailable. Give me a direct URL to read instead.")
+            return ToolResult(False, "This search attempt failed. Try a different query/source or read a known public source; never fabricate results.")
 
 
 class BrowseWebpageTool:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass, field
 from uuid import UUID, uuid4
 
@@ -11,6 +12,7 @@ class Job:
     id: UUID
     text: str
     model: object | None
+    created_at: float = field(default_factory=time.time)
     forked: bool = False
     task: asyncio.Task | None = None
     reply: str | None = None
@@ -23,6 +25,8 @@ class Job:
     delivery_started: bool = False
     acknowledged: bool = False
     acknowledgement_due: bool = False
+    speech_eos_at: float | None = None
+    first_text_at: float | None = None
 
 
 class BackgroundAgents:
@@ -57,6 +61,33 @@ class BackgroundAgents:
                 return registry.command_status()
         return self.model._tools.command_status()
 
+    def contextual_status(self, text, context=None):
+        from athena.tools.status import is_status_question, topic_tool
+        from athena.tools.models import ToolResult
+        if not is_status_question(text):
+            return None
+        wanted = topic_tool(text)
+        if not wanted:
+            for message in reversed(context or []):
+                if message.get('role') == 'user' and not is_status_question(message.get('content', '')):
+                    wanted = topic_tool(message.get('content', ''))
+                    if wanted:
+                        break
+        active = [job for job in self.jobs.values() if job.task is not None and not job.task.done()]
+        if not wanted and len(active) > 1:
+            return ToolResult(False, 'Which task do you mean? ' + '; '.join(job.text[:80] for job in active))
+        for job in reversed(list(self.jobs.values())):
+            if not wanted or topic_tool(job.text) == wanted:
+                if job.task is not None and not job.task.done():
+                    registry = getattr(job.model, '_tools', self.model._tools)
+                    actual = registry.status_store.rows(wanted or topic_tool(job.text))
+                    if actual and actual[0]['updated'] >= getattr(job, 'created_at', float('inf')):
+                        return registry.contextual_status(text, context)
+                    return ToolResult(True, 'I am still processing your request: ' + job.text[:160] +
+                                      '. I have no confirmed completion yet.', {'status': 'processing'})
+        registry = self.approval_model._tools if self.approval_model else self.model._tools
+        return registry.contextual_status(text, context)
+
     def submit(self, text, context):
         if len(self.jobs) >= self.limit:
             return None
@@ -80,7 +111,10 @@ class BackgroundAgents:
         for existing in self.jobs.values():
             pending_context.extend([
                 {"role": "user", "content": existing.text},
-                {"role": "assistant", "content": "This request is still running separately; no result has been delivered yet."},
+                {"role": "assistant", "content": (
+                    "This conversation request is still being processed; this is NOT proof that any tool action has started."
+                    if existing.task is not None and not existing.task.done() else
+                    "This conversation reply is awaiting delivery; check_tool_status is required to verify any action.")},
             ])
         job = Job(uuid4(), text, worker, forked=forked)
         self.jobs[job.id] = job
@@ -102,10 +136,12 @@ class BackgroundAgents:
         try:
             parts: list[str] = []
             async for part in job.model.stream_reply(
-                    job.id, job.text, context, on_connected=acknowledge):
+                    job.id, job.text, context,
+                    on_connected=acknowledge if web_heavy else lambda: None):
                 parts.append(part)
                 await job.reply_fragments.put(part)
                 if not job.reply_started:
+                    job.first_text_at = time.time()
                     job.reply_started = True
                     self.changed.set()
             job.reply = "".join(parts)

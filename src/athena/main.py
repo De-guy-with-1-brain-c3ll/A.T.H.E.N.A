@@ -7,13 +7,14 @@ import sys
 from athena.audio.capture import Microphone
 from athena.audio.playback import Speaker
 from athena.audio.vad import VoiceGate
+from athena.audio.routing import AudioRouter
 from athena.config import Settings, load_local_environment
 from athena.coordinator import VoiceCoordinator
 from athena.llm.deepseek import DeepSeekLanguageModel
 from athena.memory.service import MemoryService
 from athena.remote_audio import BrowserMicrophone, BrowserSpeaker, RemoteAudio
 from athena.services import build_registry
-from athena.stt import build_recognizer
+from athena.stt import build_local_wake_recognizer, build_recognizer
 from athena.settings.store import RuntimeSettingsStore
 from athena.tts import build_synthesizer, synthesizer_sample_rate
 from athena.voice_ipc import VoiceAudioServer, VoiceControlServer
@@ -31,25 +32,26 @@ async def run() -> None:
     # Browser mode keeps the assistant on this machine while the microphone and
     # speaker come from a device on the local network through the dashboard. The
     # Pi's own ALSA devices stay closed, so no sound hardware is needed.
-    audio = RemoteAudio() if browser_audio_enabled() else None
-    if audio is not None:
-        speaker = BrowserSpeaker(audio, synthesizer_sample_rate(settings))
-        microphone = BrowserMicrophone(audio)
-    else:
-        speaker = Speaker(synthesizer_sample_rate(settings),
-                          device=settings.audio_output_device)
-        microphone = Microphone(settings.stt_sample_rate, device=settings.audio_input_device)
+    audio = RemoteAudio()
+    router = AudioRouter(audio,
+        lambda: (Microphone(settings.stt_sample_rate, device=settings.audio_input_device),
+                 Speaker(synthesizer_sample_rate(settings), device=settings.audio_output_device)),
+        lambda: (BrowserMicrophone(audio), BrowserSpeaker(audio, synthesizer_sample_rate(settings))),
+        target="computer" if browser_audio_enabled() else "pi")
+    microphone, speaker = router.microphone, router.speaker
     netease_player = NetEasePlayer(speaker)
     tools, alerts = build_registry(settings_store, netease_player=netease_player)
+    local_wake_stt = build_local_wake_recognizer(settings)
     coordinator = VoiceCoordinator(
         microphone=microphone,
         speaker=speaker,
         stt=build_recognizer(settings),
         llm=DeepSeekLanguageModel(
-            settings.deepseek_api_key,
-            settings.deepseek_model,
+            settings.voice_llm_api_key,
+            settings.voice_llm_model,
             tools,
             settings_store,
+            base_url=settings.voice_llm_base_url,
         ),
         tts=build_synthesizer(settings, settings_store),
         memory=MemoryService(
@@ -66,8 +68,10 @@ async def run() -> None:
         ),
         settings_store=settings_store,
         audio_debug=settings.audio_debug,
+        local_wake_stt=local_wake_stt,
     )
     alerts.notify = coordinator.enqueue_external_speech
+    coordinator.audio_router = router
     coordinator.alerts = alerts
     # The sleep tools would otherwise run a consolidation inline, inside a spoken
     # turn, and time out on work that was going to succeed. With the coordinator
@@ -81,7 +85,7 @@ async def run() -> None:
         alerts.ensure_watch("cj_schedule", {"at": os.environ.get("ATHENA_CJ_SCHEDULE_AT", "16:00")},
                             "the Communication Journal schedule", 86_400)
     control = VoiceControlServer(coordinator)
-    audio_bridge = VoiceAudioServer(audio) if audio is not None else None
+    audio_bridge = VoiceAudioServer(audio) if os.name == "posix" else None
     try:
         await coordinator.connect()
         await alerts.start()

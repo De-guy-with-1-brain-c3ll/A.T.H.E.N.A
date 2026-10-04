@@ -33,6 +33,7 @@
       <button class="tab" data-page="history">Conversations</button>
       <button class="tab" data-page="prompts">Prompts</button>
       <button class="tab" data-page="settings">Settings</button>
+      <button class="tab" data-page="agents">Agents</button>
       <button id="logout" class="ghost right">Sign out</button>
     </nav>
 
@@ -42,8 +43,12 @@
         <h2 id="serviceHeading">Checking status</h2>
         <div class="control-row">
           <button data-service="start">Start</button>
-          <button data-service="restart" class="secondary">Restart</button>
+          <button id="restartAthena" data-service="restart" class="secondary" title="Restart the ATHENA voice service">Restart ATHENA</button>
           <button data-service="stop" class="danger">Stop</button>
+        </div>
+        <div class="control-row restart-all-row">
+          <button data-service="restart_all" class="secondary">Restart everything</button>
+          <span class="muted restart-all-hint">Voice and this dashboard.</span>
         </div>
         <p id="controlMessage" class="muted">Status refreshes continuously.</p>
         <section class="music-control" aria-label="Music controls">
@@ -59,6 +64,17 @@
           </label>
           <input id="musicVolume" class="volume-slider" type="range" min="0" max="100" step="1" value="35">
           <p id="musicMessage" class="muted music-message">Controls connect directly to the ATHENA speaker.</p>
+          <div class="playlist-block">
+            <div class="music-heading"><p class="eyebrow">PLAYLISTS</p><span id="playlistCount" class="music-state">0 SAVED</span></div>
+            <div id="playlistList" class="playlist-list" aria-live="polite"></div>
+            <form id="playlistForm" class="playlist-form">
+              <input id="playlistName" type="text" maxlength="80" placeholder="Name" required aria-label="Playlist name">
+              <input id="playlistQuery" type="text" maxlength="300" placeholder="What to search for, e.g. lofi instrumental" required aria-label="Music search query">
+              <input id="playlistMoods" type="text" maxlength="120" placeholder="Moods it suits: focus, calm" aria-label="Mood tags, comma separated">
+              <button type="submit">Add playlist</button>
+            </form>
+            <p id="playlistMessage" class="muted music-message">Add a name, a search, and the moods it suits — then ask ATHENA to choose one for you.</p>
+          </div>
         </section>
         <label class="volume-control" for="speakerVolume">
           <span>Speaker volume</span><output id="speakerVolumeLabel">100%</output>
@@ -70,6 +86,7 @@
         <div class="chat-head"><div><p class="eyebrow">DIRECT LINK</p><h2>Talk to ATHENA</h2></div><span id="taskCount" class="pill">READY</span></div>
         <label class="output-choice">Reply audio
           <select id="replyOutput">
+            <option value="computer" selected>This computer (spoken here, free)</option>
             <option value="athena">ATHENA speaker</option>
             <option value="device">This device</option>
             <option value="off">Text only</option>
@@ -91,13 +108,36 @@
         <div class="control-row">
           <button id="micStart" type="button">Start</button>
           <button id="micStop" type="button" class="secondary" disabled>Stop</button>
+            <button id="audioToComputer" type="button" class="secondary">Use computer</button>
+            <button id="audioToPi" type="button" class="secondary">Use Pi</button>
         </div>
         <div class="meter" role="presentation"><span id="micMeter"></span></div>
         <p id="micStatus" class="muted">Not connected.</p>
+        <div class="speech-panel">
+          <div class="speech-head">
+            <span id="speechState" class="pill">NO DATA</span>
+            <span id="speechRetention" class="muted">retention unknown</span>
+          </div>
+          <p id="speechHeard" class="speech-heard">Nothing heard yet.</p>
+          <p id="speechFinal" class="speech-final"></p>
+        </div>
         <p class="muted">Use headphones. Otherwise the microphone hears ATHENA's own voice.</p>
       </article>
     </section>
 
+    <section id="agents" class="page">
+      <div class="card">
+        <p class="eyebrow">BACKGROUND SUPERVISOR</p><h2>Agents</h2>
+        <p class="muted">Keep chatting while agents research, write and test. Two workers maximum; shared time and token ceilings. Protected actions still need your approval.</p>
+        <form id="agentForm"><label for="agentObjective">Objective</label>
+          <textarea id="agentObjective" maxlength="2000" rows="3" required placeholder="Research this topic and produce a verified report…"></textarea>
+          <button type="submit">Start background agent</button>
+        </form>
+        <p id="agentMessage" class="muted" role="status"></p>
+        <button id="refreshAgents" class="secondary" type="button">Refresh progress</button>
+        <div id="agentList"></div>
+      </div>
+    </section>
     <section id="history" class="page">
       <article class="card">
         <div class="section-head"><div><p class="eyebrow">SHARED MEMORY</p><h2>Recent conversations</h2></div><button id="refreshHistory" class="secondary">Refresh</button></div>
@@ -121,6 +161,14 @@
     </section>
 
     <section id="settings" class="page">
+      <article class="card">
+        <p class="eyebrow">THIS COMPUTER</p><h2>PC browser control</h2>
+        <label><input id="pcKeyboardControl" type="checkbox"> Allow ATHENA to type, press keys and click in its PC browser</label>
+        <p class="muted">Off by default. Applies only to ATHENA's dedicated browser, not your entire desktop. Opening pages does not enable keyboard control.</p>
+        <p class="muted">Screenshot analysis sends the requested browser view to Qwen vision and may incur API charges. No continuous screenshots.</p>
+        <button id="refreshPCBrowser" type="button" class="secondary">Check PC connection</button>
+        <p id="pcBrowserStatus" class="muted">Not checked.</p>
+      </article>
       <article class="card">
         <div class="section-head"><div><p class="eyebrow">TUNING</p><h2>Settings</h2></div><button id="refreshSettings" class="secondary">Refresh</button></div>
         <p class="muted">Changes save to the Pi and apply on the next voice turn unless marked otherwise.</p>

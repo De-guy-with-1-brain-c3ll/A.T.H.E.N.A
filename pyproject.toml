@@ -16,6 +16,7 @@ dependencies = [
   "openai>=1.0",
   "msal>=1.31,<2",
   "PyAudio>=0.2.14",
+  "PyYAML>=6,<7",
   # Optional local speech, used when ATHENA_STT_BACKEND=sensevoice or
   # ATHENA_TTS_BACKEND=sherpa. It is a small wheel with a self-contained ONNX
   # runtime and it carries CPU-only aarch64 builds, so it costs little to install
@@ -32,7 +33,7 @@ dependencies = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-athena = ["system/*.txt", "web_static/*", "*.html"]
+athena = ["system/*.txt", "system/*.json", "web_static/*", "*.html"]
 
 [project.scripts]
 athena-tools = "athena.tools.cli:main"
@@ -40,6 +41,7 @@ athena-chat = "athena.text:main"
 athena-feishu = "athena.feishu:main"
 athena-audio-monitor = "athena.audio.telemetry:main"
 athena-web = "athena.web:main"
+athena-pc-inbox = "athena.pc_transfer:main"
 athena-teams-login = "athena.tools.teams:login"
 athena-teams-check = "athena.tools.teams:check"
 athena-sleep = "athena.sleep:main"

@@ -1,0 +1,1 @@
+athena ALL=(root) NOPASSWD: /usr/local/bin/athena-vpn-control status, /usr/local/bin/athena-vpn-control endpoints, /usr/local/bin/athena-vpn-control start, /usr/local/bin/athena-vpn-control stop, /usr/local/bin/athena-vpn-control select

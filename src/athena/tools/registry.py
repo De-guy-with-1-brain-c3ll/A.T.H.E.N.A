@@ -16,9 +16,11 @@ from jsonschema import Draft202012Validator
 
 from athena.alerts import AlertScheduler
 from athena.tools.models import PermissionLevel, Tool, ToolResult
+from athena.tools.status import ToolStatus, CheckToolStatus, is_status_question, topic_tool
 
 
 class ToolRegistry:
+    is_task_status_query = staticmethod(is_status_question)
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
         self._pending: tuple[str, dict, float] | None = None
@@ -30,6 +32,93 @@ class ToolRegistry:
         self._command_tasks: set[asyncio.Task] = set()
         self._armbian_choice_pending = False
         self._retry_action: str | None = None
+        self.status_store = ToolStatus()
+        self._pending_operation = None
+        self.register(CheckToolStatus(self.status_store))
+
+    def enable_persistent_status(self, path):
+        self.status_store = ToolStatus(path)
+        self._tools['check_tool_status'] = CheckToolStatus(self.status_store)
+        transfer_status = self.get('pc_transfer_status')
+        if transfer_status is not None:
+            transfer_status.store = self.status_store
+
+    def _begin_operation(self, name, arguments, timeout, confirmed=False):
+        if confirmed and self._pending_operation:
+            rows = self.status_store.rows(operation_id=self._pending_operation)
+            if rows and rows[0]['tool'] == name:
+                operation, self._pending_operation = self._pending_operation, None
+                self.status_store.resume(operation, timeout)
+                return operation
+        return self.status_store.begin(name, arguments, timeout)
+
+    def contextual_status(self, text, context=None):
+        if not is_status_question(text):
+            return None
+        tool = topic_tool(text)
+        explicit_topic = tool is not None
+        for name in self.names():
+            if name in text or name.replace('_', ' ') in text.casefold():
+                if name != 'check_tool_status':
+                    tool = name
+                    break
+        # Unknown named subsystem health questions should reach its own tool,
+        # not accidentally return the receipt of an unrelated earlier action.
+        if tool is None and not re.search(
+                r'\b(?:it|that|this|you|task|operation|job)\b', text.casefold()) and text.casefold().strip() not in {'status', 'progress'}:
+            return None
+        if not tool:
+            for message in reversed(context or []):
+                if message.get('role') == 'user' and not is_status_question(message.get('content', '')):
+                    tool = topic_tool(message.get('content', ''))
+                    if tool:
+                        break
+        # A completed child tool is not completion of its supervising agent.
+        # Resolve pronouns through the actual receipt's agent ownership.
+        manager = getattr(self.get('agent_task'), 'manager', None)
+        if manager and not explicit_topic:
+            receipts = self.status_store.rows(tool)
+            agents = manager.rows()
+            if receipts:
+                receipt = receipts[0]
+                owner = next((agent for agent in agents if any(
+                    event['id'] == receipt['id'] for event in agent['evidence'])), None)
+                roots = manager.rows(owner['root']) if owner else []
+                if not roots and receipt['tool'] == 'agent_task' and receipt['state'] == 'submitted':
+                    roots = [agent for agent in agents if agent['parent'] is None][:1]
+                if roots:
+                    row = roots[0]
+                    return ToolResult(row['state'] == 'complete',
+                        f"Agent {row['id']} ({row['objective'][:100]}): {row['state']}. " +
+                        (row['report'][:1000] or row['progress']), {'agent': row})
+        # Preserve existing live download/command counters, but never guess download
+        # just because a question contains "it".
+        if tool == 'download_file' and self._last_download:
+            return self.download_status()
+        if tool == 'run_command' and self._last_command:
+            return self.command_status()
+        if tool == 'agent_task' and getattr(self.get(tool), 'manager', None):
+            rows = [row for row in self.get(tool).manager.rows() if row['parent'] is None]
+            if rows:
+                row = rows[0]
+                return ToolResult(row['state'] == 'complete',
+                                  f"Agent {row['id']} ({row['objective'][:100]}): {row['state']}. " +
+                                  (row['report'][:1000] or row['progress']), {'agent': row})
+        return self.status_store.result(tool)
+
+    def background_summary(self):
+        parts = []
+        for name in ('agent_task', 'background_workflow'):
+            manager = getattr(self.get(name), 'manager', None)
+            if manager:
+                for row in manager.rows():
+                    if row.get('parent') is None and row['state'] in {'queued', 'running', 'waiting'}:
+                        parts.append(f"{row.get('objective', row.get('title', 'Task'))[:100]}: {row['state']}")
+        if self._last_download.get('status') == 'downloading':
+            parts.append(self.download_status().spoken_text)
+        if self._last_command.get('status') == 'running':
+            parts.append(self.command_status().spoken_text)
+        return '; '.join(parts[:5]) or 'No active long-running tool tasks are recorded.'
 
     APPROVE = {"yes", "ys", "y", "ye", "yep", "yeah", "sure", "do it", "proceed",
                "yes please", "yes i approve", "i approve", "approve", "approve download",
@@ -144,7 +233,8 @@ class ToolRegistry:
         pronoun_status = re.search(
             r"\b(?:is|was|has|did)\s+it\s+(?:still\s+)?(?:download(?:ing|ed)?|done|finished|failed|working)\b",
             command)
-        return bool((download_word and status_word) or pronoun_status)
+        return bool((download_word and status_word) or
+                    (pronoun_status and download_word))
 
     def download_status(self):
         state = self._last_download
@@ -208,6 +298,7 @@ class ToolRegistry:
         registry._last_command = self._last_command
         registry._command_tasks = self._command_tasks
         registry._control = self._control
+        registry.status_store = self.status_store
         return registry
 
     def present_approval(self):
@@ -216,8 +307,15 @@ class ToolRegistry:
         if self._pending:
             name, arguments, _ = self._pending
             self._pending = (name, arguments, time.monotonic() + 120)
+            if self._pending_operation:
+                self.status_store.finish(self._pending_operation, 'waiting_approval')
 
     def clear_approval(self):
+        if self._pending_operation:
+            rows = self.status_store.rows(operation_id=self._pending_operation)
+            if rows and rows[0]['state'] in {'waiting_approval', 'approval_expired'}:
+                self.status_store.finish(self._pending_operation, 'cancelled', 'Approval cleared; action did not start.')
+            self._pending_operation = None
         self._pending = None
 
     @classmethod
@@ -312,7 +410,19 @@ class ToolRegistry:
             return original
         return None
 
-    async def handle_user_command(self, text: str) -> ToolResult | None:
+    async def handle_user_command(self, text: str, context=None) -> ToolResult | None:
+        command = self.normalize_command(text)
+        if command in {'background status', 'task status', 'what are you working on'}:
+            return ToolResult(True, self.background_summary())
+        if self.get('agent_task') and re.search(r'\b(?:agents?|subagents?)\b', command) and re.search(r'\b(?:status|progress|working|done|finished|report|reports)\b', command):
+            arguments = {'action': 'report' if 'report' in command else 'status'}
+            ident = re.search(r'\b[0-9a-f]{12}\b', command)
+            if ident:
+                arguments['id'] = ident.group(0)
+            return await self.execute('agent_task', arguments)
+        status = self.contextual_status(text, context)
+        if status is not None:
+            return status
         """Called ONLY on a fresh user transcript, never on model or website text."""
         command = self.normalize_command(text)
         # Routine alarms stay local: no DeepSeek request and no token cost.
@@ -341,6 +451,10 @@ class ToolRegistry:
                 return await self.execute("cancel_watch", {"watch_id": watch_match.group(1)})
         music = self._tools.get("netease_music")
         if music is not None:
+            if re.search(r"\b(?:choose|pick|auto(?:matically)?|surprise me with)\b.*\b(?:playlist|music)\b", command):
+                return await self.execute("netease_music", {"action": "auto_play", "query": command})
+            if re.search(r"\b(?:play|start|put on)\s+(?:my\s+)?(?:a\s+)?playlist\b", command):
+                return await self.execute("netease_music", {"action": "auto_play", "query": command})
             if (re.search(r"\b(?:pause|resume|continue|stop|skip|next)\b", command)
                     and (re.search(r"\b(?:music|song|track|netease|playing)\b", command)
                          or command in {"pause", "resume", "continue", "stop", "skip", "next"})):
@@ -427,7 +541,7 @@ class ToolRegistry:
                 if passed else "Internet browser test failed; Chromium did not return the expected page.",
                 {"diagnostic": "browse_webpage", "tool_success": result.success,
                  "expected_content": has_marker, "result": copy.deepcopy(result.data)})
-        if command in self.APPROVE:
+        if command in self.APPROVE and (self._pending is not None or command.startswith("approve")):
             pending, self._pending = self._pending, None  # One use, even on failure.
             if pending is None:
                 return ToolResult(False, "There is no real action waiting for approval.")
@@ -435,6 +549,14 @@ class ToolRegistry:
             if time.monotonic() >= expires:
                 return ToolResult(False, "That approval expired. Ask for the action again.")
             started = time.monotonic()
+            if name == "upload_to_pc":
+                tool = self._tools[name]
+                tool.status = "Sending the approved file to your PC."
+                operation = self._begin_operation(name, arguments, tool.definition.timeout_seconds, confirmed=True)
+                task = asyncio.create_task(self._finish_upload(tool, arguments, operation))
+                self._command_tasks.add(task)
+                task.add_done_callback(self._command_tasks.discard)
+                return ToolResult(True, "Sending it to your PC in the background.")
             if name == "run_command":
                 self._last_command.update({"status": "running", "success": False,
                     "arguments": copy.deepcopy(arguments), "started_at": datetime.now(timezone.utc).isoformat(),
@@ -457,6 +579,13 @@ class ToolRegistry:
                 self._last_download.update(bytes_downloaded=received,
                     bytes_total=total or self._last_download.get("bytes_total"),
                     bytes_per_second=received / elapsed)
+                from athena.metrics import progress as publish
+                now = time.monotonic()
+                if now - getattr(self, '_progress_at', 0) >= .5:
+                    self._progress_at = now
+                    publish('download', {'state': 'downloading', 'filename': arguments.get('filename'),
+                        'bytes_done': received, 'bytes_total': total, 'bytes_per_second': received / elapsed})
+            progress(0, metadata.get('bytes'))
             task = asyncio.create_task(self._finish_download(name, arguments, progress))
             self._download_tasks.add(task)
             task.add_done_callback(self._download_tasks.discard)
@@ -466,6 +595,12 @@ class ToolRegistry:
         if command in self.DENY and self._pending:
             name = self._pending[0]
             self._pending = None
+            if self._pending_operation:
+                self.status_store.finish(self._pending_operation, 'cancelled')
+            if name == "upload_to_pc":
+                if self._pending_operation:
+                    self.status_store.finish(self._pending_operation, 'cancelled')
+                return ToolResult(True, "File transfer cancelled.")
             if name == "run_command":
                 self._last_command["status"] = "cancelled"
                 return ToolResult(True, "Command cancelled.")
@@ -476,19 +611,40 @@ class ToolRegistry:
             if url:
                 return ToolResult(True, "I've printed the inspected URL in the terminal.", {"display_url": url})
         if self._pending and command in {"okay", "ok"}:
-            action = "command" if self._pending[0] == "run_command" else "download"
+            action = "file transfer" if self._pending[0] == "upload_to_pc" else "command" if self._pending[0] == "run_command" else "download"
             return ToolResult(False, f"Say yes to approve this {action}, or no to cancel.")
         # A different request invalidates old permission; it cannot authorize a later job.
-        self._pending = None
+        self.clear_approval()
         return None
+
+    async def _finish_upload(self, tool, arguments, operation):
+        try:
+            result = await self._tracked_call('upload_to_pc', tool.execute(arguments), operation)
+        except asyncio.CancelledError:
+            tool.status = 'File transfer interrupted; check the PC inbox before retrying.'
+            raise
+        except Exception:
+            result = ToolResult(False, 'PC transfer failed; no complete receipt was received.')
+        tool.status = result.spoken_text
+        if not result.success:
+            from athena.metrics import progress
+            progress('transfer', {'state': 'failed', 'message': result.spoken_text})
+        # A notification failing must never undo a verified file receipt.
+        if tool.notify:
+            try:
+                notification = tool.notify(result.spoken_text)
+                if inspect.isawaitable(notification):
+                    await notification
+            except Exception:
+                pass
 
     async def _finish_download(self, name, arguments, progress):
         try:
             tool = self._tools[name]
             execute = getattr(tool, "execute_with_progress", None)
             if execute is not None:
-                result = await asyncio.wait_for(execute(arguments, progress),
-                                                timeout=tool.definition.timeout_seconds)
+                operation = self._begin_operation(name, arguments, tool.definition.timeout_seconds, confirmed=True)
+                result = await self._tracked_call(name, execute(arguments, progress), operation)
             else:
                 result = await self.execute(name, arguments, confirmed=True)
             self._last_download.update({"status": "complete" if result.success else "failed",
@@ -514,6 +670,12 @@ class ToolRegistry:
         except Exception:
             self._last_download.update({"status": "failed", "success": False,
                 "message": "The background download failed."})
+        finally:
+            from athena.metrics import progress as publish
+            publish('download', {'state': self._last_download.get('status'),
+                'filename': arguments.get('filename'), 'message': self._last_download.get('message'),
+                'bytes_done': self._last_download.get('bytes_downloaded', 0),
+                'bytes_total': self._last_download.get('bytes_total'), 'bytes_per_second': 0})
 
     async def _finish_command(self, name, arguments):
         try:
@@ -600,6 +762,40 @@ class ToolRegistry:
         return tuple(self._tools)
 
     async def execute(
+        self, name: str, arguments: dict[str, Any], *, confirmed: bool = False,
+    ) -> ToolResult:
+        if name == 'check_tool_status':
+            return await self._execute(name, arguments, confirmed=confirmed)
+        tool = self._tools.get(name)
+        timeout = tool.definition.timeout_seconds if tool else 10
+        operation = self._begin_operation(name, arguments, timeout, confirmed)
+        result = await self._tracked_call(name, self._execute(name, arguments, confirmed=confirmed),
+                                          operation, timeout=False)
+        if result.data.get('pending_approval') or result.data.get('approval_required'):
+            self._pending_operation = operation
+        return ToolResult(result.success, result.spoken_text, {**result.data, 'operation_id': operation})
+
+    async def _tracked_call(self, name, call, operation, timeout=True):
+        try:
+            tool = self._tools.get(name)
+            result = await asyncio.wait_for(call, tool.definition.timeout_seconds) if timeout else await call
+            state = ('waiting_approval' if result.data.get('pending_approval') or
+                     result.data.get('approval_required') else 'completed' if result.success else 'failed')
+            if name == 'background_workflow' and result.success and result.data.get('task_id'):
+                state = 'submitted'
+            if name == 'agent_task' and result.success and result.data.get('background_started'):
+                state = 'submitted'
+            self.status_store.finish(operation, state, result.spoken_text)
+            return result
+        except asyncio.CancelledError:
+            self.status_store.finish(operation, 'cancelled')
+            raise
+        except Exception as error:
+            self.status_store.finish(operation, 'failed',
+                                     f'{name} failed ({type(error).__name__}); no completion confirmed.')
+            raise
+
+    async def _execute(
         self,
         name: str,
         arguments: dict[str, Any],
@@ -614,6 +810,15 @@ class ToolRegistry:
         if name == "shutdown_athena" and not self._shutdown_authorized:
             return ToolResult(False, "Say shut down ATHENA to stop the assistant.")
         if definition.permission is not PermissionLevel.SAFE and not confirmed:
+            if name == "run_command" and getattr(tool, "can_run_unattended", lambda _args: False)(arguments):
+                return await self.execute(name, arguments, confirmed=True)
+            if name == "upload_to_pc":
+                try:
+                    prepared, message = await tool.prepare(arguments)
+                    self._pending = (name, prepared, time.monotonic() + 120)
+                    return ToolResult(True, message, {"pending_approval": True, "approval_required": True})
+                except (ValueError, OSError) as error:
+                    return ToolResult(False, str(error))
             if name == "download_file":
                 try:
                     return await self._prepare_download(tool, arguments)

@@ -24,6 +24,7 @@ import asyncio
 import os
 from pathlib import Path
 import shutil
+import unicodedata
 from uuid import UUID
 
 from athena.events import AudioChunk
@@ -42,8 +43,12 @@ QUIET_SETTLE_SECONDS = 0.15
 # Thrown away by warm(): short enough to cost nothing, real enough that Piper
 # produces audio whose end marks the voice as loaded.
 WARM_PHRASE = b"Hi.\n"
-# A poll this long with no audio means Piper has finished the warm-up sentence.
-SWALLOW_POLL_SECONDS = 0.6
+# A quiet poll after warm-up audio means Piper has finished the tiny "Hi."
+# phrase.  The old 600 ms was longer than the phrase itself and put an
+# avoidable half-second on readiness during service boot.  200 ms still drains
+# the phrase before the live reader takes ownership, without delaying the first
+# real reply behind an idle sleep.
+SWALLOW_POLL_SECONDS = 0.2
 
 
 def voices_directory() -> Path:
@@ -71,14 +76,15 @@ def piper_sample_rate() -> int:
 def piper_idle_seconds() -> float:
     """How long an unused Piper process is kept loaded.
 
-    Five minutes covers the gap between replies in a real conversation, so the
-    voice stays loaded while someone is talking to ATHENA and is released once
-    they have stopped. Zero disables retirement and keeps it loaded forever.
+    A warm voice is the difference between a quick reply and a cold model load.
+    The default therefore keeps it for the service lifetime. Set a positive
+    value only when reclaiming the model's memory matters more than the first
+    reply after a pause; zero disables retirement.
     """
     try:
-        return max(0.0, float(os.environ.get("ATHENA_PIPER_IDLE_SECONDS", "300")))
+        return max(0.0, float(os.environ.get("ATHENA_PIPER_IDLE_SECONDS", "0")))
     except ValueError:
-        return 300.0
+        return 0.0
 
 
 def piper_turn_timeout_seconds() -> float:
@@ -114,6 +120,25 @@ def piper_environment() -> dict[str, str]:
     environment = dict(os.environ)
     environment["PYTHONUNBUFFERED"] = "1"
     return environment
+
+
+def piper_input_text(text: str) -> str:
+    """Make streamed assistant prose safe for Piper's Windows CLI parser.
+
+    The installed Piper build can silently produce no audio for a spaced em dash
+    (``"Got it — CJ"``), even though the same words with ASCII punctuation work.
+    Models regularly emit typographic punctuation, so convert those presentation
+    characters before sending a line. This is intentionally limited to English
+    punctuation; it does not strip ordinary non-ASCII words from another voice.
+    """
+    replacements = str.maketrans({
+        "—": "-", "–": "-", "−": "-",
+        "“": '"', "”": '"', "„": '"',
+        "‘": "'", "’": "'", "…": "...",
+        "\u00a0": " ",
+    })
+    # NFKC also turns full-width ASCII punctuation into the form Piper expects.
+    return unicodedata.normalize("NFKC", text).translate(replacements)
 
 
 def find_voice(name: str) -> Path | None:
@@ -163,7 +188,7 @@ class PiperSynthesizer:
     Same interface as the cloud synthesizer, so the coordinator is unchanged.
 
     The Piper process is started once and then fed a line per clause until it
-    goes idle (`ATHENA_PIPER_IDLE_SECONDS`, default 300s), which is the point of
+    goes idle only when configured (`ATHENA_PIPER_IDLE_SECONDS`, default 0), which is the point of
     the design: Piper reads sentences as a stream, so one process can answer many
     turns and the ~1.8s voice load is paid once rather than per reply.
     """
@@ -191,6 +216,12 @@ class PiperSynthesizer:
         self._audio: asyncio.Queue[AudioChunk | UUID] = asyncio.Queue()
         self._process: asyncio.subprocess.Process | None = None
         self._task: asyncio.Task | None = None
+        # `warm()` starts at service boot while the first user utterance may
+        # already be in flight.  Without a lock, `send_text()` sees no live
+        # process while warm-up owns an unassigned local process and starts a
+        # second Piper.  Besides doubling the peak memory, that makes the
+        # first spoken answer compete with model loading on the small CPU.
+        self._process_lock = asyncio.Lock()
         self._turn_id: UUID | None = None
         self._voice_path = find_voice(self._voice_name)
         # `_pump` is the only stdout reader.  Completion must observe it rather
@@ -245,32 +276,47 @@ class PiperSynthesizer:
         start, which is what would have happened anyway, so it must not be able
         to break a turn that is still perfectly able to speak.
         """
-        if self._voice_path is None:
-            return False
-        process = None
-        try:
-            if self._process is not None and self._process.returncode is None:
-                return True  # already warm
-            process = await self._spawn()
-            if process.stdin is None or process.stdout is None:
-                await self._stop(process)
+        async with self._process_lock:
+            if self._voice_path is None:
                 return False
-            # A real word, not a space: Piper synthesizes nothing for whitespace,
-            # so a blank phrase loads the voice but produces no audio to detect
-            # the end of the load by. "Hi." is one sentence and a fraction of a
-            # second of audio.
-            process.stdin.write(WARM_PHRASE)
-            await process.stdin.drain()
-            await asyncio.wait_for(self._swallow_audio(process), timeout=self._warm_timeout)
-            # Hand the process on as the live one and start its single reader.
-            self._process = process
-            self._task = asyncio.create_task(self._pump())
-            return True
-        except Exception:
-            await self._stop(process)
-            self._process = None
-            self._task = None
-            return False
+            process = None
+            try:
+                if self._process is not None and self._process.returncode is None:
+                    return True  # already warm
+                process = await self._spawn()
+                if process.stdin is None or process.stdout is None:
+                    await self._stop(process)
+                    return False
+                # A real word, not a space: Piper synthesizes nothing for whitespace,
+                # so a blank phrase loads the voice but produces no audio to detect
+                # the end of the load by. "Hi." is one sentence and a fraction of a
+                # second of audio.
+                process.stdin.write(WARM_PHRASE)
+                await process.stdin.drain()
+                await asyncio.wait_for(self._swallow_audio(process), timeout=self._warm_timeout)
+                # Hand the process on as the live one and start its single reader.
+                self._process = process
+                self._task = asyncio.create_task(self._pump())
+                return True
+            except asyncio.CancelledError:
+                # `connect()` deliberately warms in the background.  A service
+                # shutdown can cancel that task while the subprocess is still
+                # local to this method; without explicit cleanup it survives
+                # as an orphan and competes with the next service start.
+                # The cancellation that brought us here remains pending and
+                # would otherwise interrupt `_stop()` at its `wait()`. Clear
+                # that one handled request, reap the child, then re-raise the
+                # same cancellation to preserve normal shutdown semantics.
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+                await self._stop(process)
+                raise
+            except Exception:
+                await self._stop(process)
+                self._process = None
+                self._task = None
+                return False
 
     async def _swallow_audio(self, process: asyncio.subprocess.Process) -> None:
         """Read and discard audio until it stops coming, which ends the load.
@@ -315,6 +361,15 @@ class PiperSynthesizer:
         """End a process that is not (or no longer) in service."""
         if process is None:
             return
+        # Close the write transport before killing.  On Windows a killed child
+        # with stdin still open can outlive `wait()` at transport teardown and
+        # produce a misleading "Close running child process" warning.
+        stdin = process.stdin
+        if stdin is not None:
+            try:
+                stdin.close()
+            except (AttributeError, OSError):
+                pass
         try:
             kill = getattr(process, "kill", None)
             if kill is not None:
@@ -329,6 +384,11 @@ class PiperSynthesizer:
                 await wait()
             except Exception:
                 pass
+        # Proactor pipe shutdown is reported to the loop a little after the
+        # child exit notification.  Let it settle before an immediately
+        # following event-loop teardown; this only runs on retirement/failure,
+        # never on a spoken reply.
+        await asyncio.sleep(0.05)
 
     async def _ensure_process(self) -> bool:
         """Start Piper if it is not already running. Idempotent, never restarts."""
@@ -342,6 +402,7 @@ class PiperSynthesizer:
         return True
 
     async def send_text(self, turn_id: UUID, text: str) -> None:
+        text = piper_input_text(text)
         if not text or not text.strip():
             return
         # A new turn while the previous one was still speaking means that reply
@@ -353,10 +414,15 @@ class PiperSynthesizer:
             self._turn_saw_audio = False
             self._turn_last_audio_at = 0.0
         self._turn_id = turn_id
-        await self._ensure_process()
-        assert self._process is not None and self._process.stdin is not None
-        self._process.stdin.write((text.strip() + "\n").encode("utf-8"))
-        await self._process.stdin.drain()
+        # If the background boot warm-up is still loading, wait for its process
+        # rather than spawning another cold model beside it.  The lock is held
+        # only through process selection and the tiny stdin write, never while
+        # synthesizing or playing audio.
+        async with self._process_lock:
+            await self._ensure_process()
+            assert self._process is not None and self._process.stdin is not None
+            self._process.stdin.write((text.strip() + "\n").encode("utf-8"))
+            await self._process.stdin.drain()
 
     async def _pump(self) -> None:
         """Read Piper's raw PCM and hand it on in chunks.

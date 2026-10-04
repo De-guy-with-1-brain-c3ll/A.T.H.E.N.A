@@ -61,6 +61,42 @@ class WebToolTests(unittest.IsolatedAsyncioTestCase):
         http.get.return_value = WebResponse("https://example.com", b'<!DOCTYPE rss><rss/>', "application/xml")
         self.assertFalse((await tool.execute({"query": "test"})).success)
 
+    async def test_empty_search_refines_once_without_extra_model_tokens(self):
+        http = AsyncMock()
+        empty = WebResponse("https://www.bing.com/search", b"<rss><channel/></rss>", "application/rss+xml")
+        usable = WebResponse("https://www.bing.com/search", b'<rss><channel><item><title>Relevant article</title><link>https://example.com</link></item></channel></rss>', "application/rss+xml")
+        http.get.side_effect = [empty, usable]
+        result = await SearchWebTool(http).execute({"query": "please find me solar panels"})
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.data["attempted_queries"]), 2)
+        self.assertNotEqual(*result.data["attempted_queries"])
+        self.assertEqual(http.get.await_count, 2)
+
+    async def test_empty_search_has_a_hard_two_request_limit(self):
+        http = AsyncMock()
+        http.get.return_value = WebResponse("https://www.bing.com/search", b"<rss><channel/></rss>", "application/rss+xml")
+        result = await SearchWebTool(http).execute({"query": "Chinese news today"})
+        self.assertFalse(result.success)
+        self.assertEqual(http.get.await_count, 2)
+        self.assertTrue(result.data["chinese_news_filter"])
+
+    async def test_chinese_news_filters_dictionary_matches_and_non_news_domains(self):
+        http = AsyncMock()
+        http.get.return_value = WebResponse(
+            "https://www.bing.com/search",
+            """<rss><channel>
+              <item><title>today是什么意思</title><link>https://baike.baidu.com/item/today</link><description>translation</description></item>
+              <item><title>China Daily News</title><link>https://news.qq.com/rain/2026-10-02</link><description>今日要闻</description></item>
+            </channel></rss>""".encode("utf-8"),
+            "application/rss+xml",
+        )
+        result = await SearchWebTool(http).execute({"query": "tell me today's news, use Chinese sources"})
+        self.assertTrue(result.success)
+        self.assertTrue(result.data["chinese_news_filter"])
+        self.assertEqual([item["url"] for item in result.data["results"]],
+                         ["https://news.qq.com/rain/2026-10-02"])
+        self.assertIn("%E4%B8%AD%E5%9B%BD", http.get.call_args.args[0])
+
     async def test_network_failure_does_not_fabricate_content(self):
         tool = ReadWebpageTool(AsyncMock(get=AsyncMock(side_effect=TimeoutError)))
         self.assertFalse((await tool.execute({"url": "https://example.com"})).success)

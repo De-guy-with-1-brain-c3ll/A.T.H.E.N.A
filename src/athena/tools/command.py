@@ -69,6 +69,13 @@ class CommandTool:
             f"Run this {shell} command in the {location}?\n{command}\nSay yes to approve, or no to cancel.",
             {"arguments": actual})
 
+    def can_run_unattended(self, arguments):
+        """Exact read-only diagnostics, not model-provided permission flags."""
+        allowed = {"bash": {"pwd", "whoami", "hostname", "ls", "ls -l", "ls -la"},
+                   "powershell": {"Get-Location", "Get-ChildItem", "whoami", "hostname"},
+                   "cmd": {"dir", "whoami", "hostname"}}
+        return arguments.get("command", "").strip() in allowed.get(arguments.get("shell"), set())
+
     async def execute(self, arguments):
         command = arguments["command"].strip()
         shell = arguments["shell"]
