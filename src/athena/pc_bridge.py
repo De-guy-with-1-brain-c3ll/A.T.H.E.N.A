@@ -8,6 +8,7 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 import aiohttp
 from athena.pc_transfer import signature
+from athena.pc_discovery import resolve_pc_url
 
 
 async def browser_request(body):
@@ -17,7 +18,8 @@ async def browser_request(body):
         raise ValueError("Configure the PC bridge first.")
     if not ipaddress.ip_address(configured.hostname).is_private:
         raise ValueError("PC bridge must be on the private LAN.")
-    url = urlunsplit((configured.scheme, configured.netloc, "/browser", "", ""))
+    resolved = urlsplit(await resolve_pc_url(configured.geturl(), key))
+    url = urlunsplit((resolved.scheme, resolved.netloc, "/browser", "", ""))
     payload = json.dumps(body).encode()
     stamp, nonce = str(int(time.time())), uuid4().hex
     digest = hashlib.sha256(payload).hexdigest()

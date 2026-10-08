@@ -46,6 +46,8 @@ class BridgeHarness:
         self.port = None
 
     async def start(self):
+        self.transport_patch=patch('athena.voice_ipc.WINDOWS_HOST',False)
+        self.transport_patch.start()
         self.server = await asyncio.start_server(self.bridge._handle, "127.0.0.1", 0)
         self.port = self.server.sockets[0].getsockname()[1]
 
@@ -57,6 +59,7 @@ class BridgeHarness:
             self.server.close()
             await self.server.wait_closed()
             self.server = None
+        self.transport_patch.stop()
 
 
 class FakeSink:

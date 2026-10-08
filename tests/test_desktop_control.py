@@ -56,6 +56,8 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(response.text), {'ok': True, 'app': 'athena', 'monitor_schema': 1})
 
     async def test_reboot_requires_auth_csrf_and_explicit_confirmation(self):
+        transport=patch('athena.web.WINDOWS_HOST',False)
+        transport.start();self.addCleanup(transport.stop)
         from aiohttp import web
         request = MagicMock(); command = AsyncMock()
         with patch('athena.web._require_post'), patch('athena.web._json_body', AsyncMock(return_value={})), patch('athena.web._systemctl', command):

@@ -18,6 +18,7 @@ class PCBrowser:
         self.navigation_state = "idle"
         self.target_url = ""
         self.navigation_error = ""
+        self.external_url = ""
 
     @staticmethod
     def check_url(url):
@@ -72,6 +73,7 @@ class PCBrowser:
             return {"keyboard_enabled": self.keyboard_enabled,
                     "url": self.page.url if self.page and not self.page.is_closed() else "",
                     "running": bool(self.page and not self.page.is_closed()),
+                    "external_url": self.external_url,
                     "navigation_state": self.navigation_state, "target_url": self.target_url,
                     "navigation_error": self.navigation_error}
         if body.get("action") == "keyboard_config":
@@ -106,6 +108,26 @@ class PCBrowser:
             try:
                 await asyncio.wait_for(self.ensure(), 10)
             except Exception as error:
+                if action == "open" and os.name == "nt":
+                    # Some locked-down Windows sessions cannot spawn the
+                    # Playwright driver. Opening the URL in the user's default
+                    # browser still satisfies a plain "open this page" request.
+                    # Inspection and keyboard control remain unavailable there.
+                    try:
+                        host = urlsplit(body['url']).hostname
+                        addresses = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(
+                            host, None, type=socket.SOCK_STREAM), 3)
+                        if not addresses or any(not ipaddress.ip_address(row[4][0]).is_global
+                                                for row in addresses):
+                            raise ValueError('Private DNS target blocked.')
+                        await asyncio.to_thread(os.startfile, body['url'])
+                        self.external_url = body['url']
+                        self.navigation_state = 'launched_external'
+                        return {'url': body['url'], 'title': '', 'running': False,
+                                'opened_external': True, 'keyboard_enabled': self.keyboard_enabled,
+                                'navigation_state': self.navigation_state}
+                    except (ValueError, OSError, TimeoutError):
+                        pass
                 self.navigation_state = "failed"
                 self.navigation_error = f"PC browser could not start: {str(error)[:200] or type(error).__name__}"
                 raise ValueError(self.navigation_error) from error

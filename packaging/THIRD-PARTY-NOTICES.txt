@@ -1,0 +1,25 @@
+ATHENA's Windows installers contain independently licensed third-party software.
+Their licenses are included in the bundled package metadata and driver folders.
+
+Python: Python Software Foundation License
+https://www.python.org/psf/license/
+
+PyInstaller: GPL with its application-distribution exception
+https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt
+
+FFmpeg 7.1 (Gyan essentials build, supplied by imageio-ffmpeg): GPL version 3
+The executable is a separate process, not linked into ATHENA.
+License: GPL-3.0.txt in this application's installation folder.
+Upstream source: https://github.com/FFmpeg/FFmpeg/tree/n7.1
+Binary/build provider and library list: https://www.gyan.dev/ffmpeg/builds/
+Imageio binary distribution: https://github.com/imageio/imageio-binaries
+
+Playwright: Apache License 2.0; its bundled driver includes additional notices.
+https://github.com/microsoft/playwright-python
+
+Sherpa-ONNX: Apache License 2.0
+https://github.com/k2-fsa/sherpa-onnx
+
+Other Python dependency licenses are retained under _internal/*.dist-info/licenses
+where provided by their distribution metadata. This notice does not replace the
+individual software licenses or grant rights beyond those licenses.

@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -13,7 +14,8 @@ import re
 import shutil
 import subprocess
 import sys
-from urllib.parse import urljoin, urlsplit
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 import zipfile
 
@@ -33,12 +35,12 @@ def signing_payload(manifest: dict) -> bytes:
             f"{manifest['archive']}\n{manifest['sha256']}\n{manifest['bytes']}\n").encode()
 
 
-def fetch(url: str, maximum: int) -> bytes:
+def fetch(url: str, maximum: int, timeout: float = 20) -> bytes:
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username:
         raise ValueError("The update URL must be a plain HTTP or HTTPS address.")
     request = Request(url, headers={"User-Agent": "ATHENA-Pi-Updater/1", "Cache-Control": "no-cache"})
-    with urlopen(request, timeout=20) as response:
+    with urlopen(request, timeout=timeout) as response:
         declared = response.headers.get("Content-Length")
         if declared and int(declared) > maximum:
             raise ValueError("The update response is too large.")
@@ -46,6 +48,42 @@ def fetch(url: str, maximum: int) -> bytes:
     if len(data) > maximum:
         raise ValueError("The update response is too large.")
     return data
+
+
+def discover_feed(configured: str, key: bytes) -> tuple[str, dict]:
+    """Find the same signed feed after the development PC changes LAN IP."""
+    parsed = urlsplit(configured)
+    address = ipaddress.ip_address(parsed.hostname or "")
+    if (address.version != 4 or not address.is_private or len(key) < 32
+            or parsed.scheme not in {"http", "https"} or parsed.username or parsed.password
+            or parsed.query or parsed.fragment):
+        raise ValueError("Update feed discovery requires a private IPv4 address.")
+    network = ipaddress.ip_network(f"{address}/24", strict=False)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    def probe(host):
+        base = urlunsplit((parsed.scheme, f"{host}:{port}", parsed.path or "/", "", ""))
+        try:
+            manifest = json.loads(fetch(urljoin(base.rstrip("/") + "/", "manifest.json"),
+                                        64 * 1024, timeout=0.8))
+            expected = hmac.new(key, signing_payload(manifest), hashlib.sha256).hexdigest()
+            if (manifest.get("schema") == 1
+                    and hmac.compare_digest(expected, str(manifest.get("signature", "")))):
+                return base, manifest
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return None
+
+    nearby = [ipaddress.ip_address(int(address) + offset)
+              for distance in range(1, 9) for offset in (-distance, distance)
+              if ipaddress.ip_address(int(address) + offset) in network]
+    rest = [host for host in network.hosts() if host != address and host not in nearby]
+    for candidates in (nearby, rest):
+        with ThreadPoolExecutor(max_workers=min(32, len(candidates))) as pool:
+            for match in pool.map(probe, map(str, candidates)):
+                if match is not None:
+                    return match
+    raise ConnectionError("No signed ATHENA update feed was found on this LAN.")
 
 
 def verify_release(manifest: dict, bundle: bytes, key: bytes) -> None:
@@ -274,7 +312,12 @@ def main() -> int:
     root = args.root.resolve()
     with update_lock(root):
         manifest_url = urljoin(args.url.rstrip("/") + "/", "manifest.json")
-        manifest = json.loads(fetch(manifest_url, 64 * 1024))
+        try:
+            manifest = json.loads(fetch(manifest_url, 64 * 1024))
+        except OSError:
+            feed_url, manifest = discover_feed(args.url, key)
+            manifest_url = urljoin(feed_url.rstrip("/") + "/", "manifest.json")
+            print(f"Found signed ATHENA feed at {feed_url} after the PC address changed.")
         version = str(manifest.get("version", ""))
         if version == current_version(root):
             print(f"ATHENA {version} is already current.")
@@ -287,7 +330,7 @@ def main() -> int:
             raise ValueError("The update archive name is invalid.")
         if len(key) < 32:
             raise ValueError("ATHENA_UPDATE_KEY must contain at least 32 characters.")
-        bundle = fetch(urljoin(args.url.rstrip("/") + "/", archive), MAX_BUNDLE_BYTES)
+        bundle = fetch(urljoin(manifest_url, archive), MAX_BUNDLE_BYTES)
         verify_release(manifest, bundle, key)
         # Checked only after the signature: an unauthenticated sequence is
         # just an attacker-controlled number.

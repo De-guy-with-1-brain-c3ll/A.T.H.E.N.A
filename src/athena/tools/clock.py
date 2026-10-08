@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone as fixed_timezone
 from zoneinfo import ZoneInfo
+import os
 
 from athena.tools.models import ToolDefinition, ToolResult
 
@@ -18,13 +19,13 @@ class ClockTool:
                     "description": "IANA timezone such as Asia/Shanghai",
                 }
             },
-            "required": ["timezone"],
+            "required": [],
             "additionalProperties": False,
         },
     )
 
     async def execute(self, arguments: dict) -> ToolResult:
-        timezone = str(arguments["timezone"])
+        timezone = str(arguments.get("timezone") or os.environ.get("ATHENA_TIMEZONE", "Asia/Shanghai"))
         try:
             if timezone.upper() == "UTC":
                 zone = fixed_timezone.utc

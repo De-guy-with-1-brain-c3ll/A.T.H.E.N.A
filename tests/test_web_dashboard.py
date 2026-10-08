@@ -183,6 +183,9 @@ class DashboardPasswordOffPageLoadTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ServiceControlTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        transport=patch('athena.web.WINDOWS_HOST',False)
+        transport.start();self.addCleanup(transport.stop)
     """Restarting "everything" must also restart the dashboard that asks.
 
     athena-web cannot survive the request that restarts it, so the web half has

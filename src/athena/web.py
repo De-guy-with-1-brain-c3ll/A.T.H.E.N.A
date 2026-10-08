@@ -238,6 +238,7 @@ async def logout(request: web.Request) -> web.Response:
     return response
 
 
+WINDOWS_HOST = os.name == 'nt'
 VOICE_SERVICE = "athena-voice.service"
 WEB_SERVICE = "athena-web.service"
 SERVICE_TIMEOUT = 20
@@ -257,6 +258,9 @@ async def _systemctl(*arguments: str, timeout: float = SERVICE_TIMEOUT) -> str:
 
 
 async def _service_status(service: str = VOICE_SERVICE) -> str:
+    if WINDOWS_HOST:
+        from athena.local_service import status
+        return await asyncio.to_thread(status, 'feishu' if 'feishu' in service else 'voice')
     process = await asyncio.create_subprocess_exec(
         "/usr/bin/systemctl", "is-active", service,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
@@ -273,6 +277,11 @@ async def _schedule_web_restart() -> None:
     waiting on the unit, which would otherwise stall this coroutine until the
     very process it belongs to is killed.
     """
+    if WINDOWS_HOST:
+        import subprocess,sys
+        command=[sys.executable,'--worker','restart-web'] if getattr(sys,'frozen',False) else [sys.executable,'-m','athena.windows_app','--worker','restart-web']
+        subprocess.Popen(command,creationflags=subprocess.CREATE_NO_WINDOW,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        return
     await asyncio.sleep(WEB_RESTART_DELAY)
     await asyncio.create_subprocess_exec(
         "sudo", "-n", "/usr/bin/systemctl", "restart", "--no-block", WEB_SERVICE,
@@ -281,6 +290,15 @@ async def _schedule_web_restart() -> None:
 
 
 async def _service_action(action: str | None = None, everything: bool = False) -> tuple[str, str]:
+    if WINDOWS_HOST:
+        from athena.local_service import control
+        if action:
+            await asyncio.to_thread(control,action)
+            if everything:
+                if os.environ.get('FEISHU_APP_ID'): await asyncio.to_thread(control,action,'feishu')
+                asyncio.create_task(_schedule_web_restart())
+        status = await _service_status()
+        return status, 'ATHENA is listening.' if status=='active' else 'ATHENA listening is stopped.'
     if action:
         if everything:
             await _systemctl(action, VOICE_SERVICE)
@@ -498,12 +516,36 @@ async def conversations(request: web.Request) -> web.Response:
     _require_auth(request)
     database = MemoryDatabase(database_path())
     await asyncio.to_thread(database.initialize)
-    rows = await asyncio.to_thread(database.recent_conversations, 40)
+    try:
+        offset = int(request.query.get('offset', '0'))
+        if not 0 <= offset <= 100000:
+            raise ValueError()
+    except ValueError:
+        raise web.HTTPBadRequest(text='Invalid history offset.') from None
+    rows = await asyncio.to_thread(database.recent_conversations, 40, offset)
     return web.json_response({"conversations": [
         {"id": str(row.turn_id), "at": row.started_at,
          "user": row.user_text, "assistant": row.assistant_text}
         for row in rows
     ]})
+
+
+async def web_evidence(request: web.Request) -> web.Response:
+    _require_auth(request)
+    from athena.web_evidence import recent
+    return web.json_response({'results': await asyncio.to_thread(recent)})
+
+
+async def clear_conversation_context(request: web.Request) -> web.Response:
+    state = _require_post(request)
+    await state.background.cancel_all()
+    # Flush queued dashboard turns before moving the shared context boundary.
+    await state.memory._queue.join()
+    stamp = await asyncio.to_thread(state.memory._database.clear_context)
+    state.memory._sync_context()
+    state.completed.clear()
+    return web.json_response({'ok': True, 'cleared_at': stamp,
+        'message': 'Conversation context cleared. Saved history and long-term memories are preserved. Applies to the next turn on every interface.'})
 
 
 async def submit_chat(request: web.Request) -> web.Response:
@@ -548,11 +590,8 @@ async def chat_status(request: web.Request) -> web.Response:
 
 def _spoken_text(text: str) -> str:
     """Remove common Markdown noise before sending a dashboard answer to TTS."""
-    import re
-    text = re.sub(r"\[([^]]+)]\([^)]*\)", r"\1", text)
-    text = re.sub(r"```.*?```", " Code omitted. ", text, flags=re.DOTALL)
-    text = re.sub(r"[`*_#>]", "", text)
-    return " ".join(text.split())[:3000]
+    from athena.tts.text import speech_text
+    return speech_text(text)[:3000]
 
 
 async def speak_on_athena(request: web.Request) -> web.Response:
@@ -697,6 +736,7 @@ async def monitor_status(request: web.Request) -> web.Response:
 
 async def reboot_pi(request: web.Request) -> web.Response:
     _require_post(request)
+    if WINDOWS_HOST:raise web.HTTPBadRequest(text='Restart your PC from the Windows Start menu.')
     body = await _json_body(request)
     if body.get('confirmation') != 'REBOOT PI':
         raise web.HTTPBadRequest(text='Explicit REBOOT PI confirmation is required.')
@@ -732,6 +772,8 @@ async def create_app() -> web.Application:
     app.router.add_post("/api/pc/keyboard", pc_keyboard_control)
     app.router.add_post("/api/settings", settings_control)
     app.router.add_get("/api/conversations", conversations)
+    app.router.add_post('/api/context/clear', clear_conversation_context)
+    app.router.add_get('/api/web-evidence', web_evidence)
     app.router.add_post("/api/chat", submit_chat)
     app.router.add_get("/api/chat/{identity}", chat_status)
     app.router.add_post("/api/speech/athena", speak_on_athena)

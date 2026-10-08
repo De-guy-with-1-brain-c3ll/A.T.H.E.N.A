@@ -53,7 +53,7 @@ class FeishuTests(unittest.IsolatedAsyncioTestCase):
         await gateway.handle(self.message(text="slow"))
         job = next(iter(gateway.background.jobs.values()))
         self.assertFalse(job.task.done())
-        self.assertIn("Task accepted", sent[0][1])
+        self.assertEqual(sent, [])
         model.release.set()
         await job.task
         await gateway.deliver_ready()
@@ -107,7 +107,7 @@ class FeishuTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(access.authorize("o", "hello"), "denied")
 
     async def test_failed_final_delivery_is_not_written_to_conversation_memory(self):
-        send = AsyncMock(side_effect=[None, OSError('offline')])
+        send = AsyncMock(side_effect=OSError('offline'))
         model = FakeModel()
         memory = NS(context_messages=lambda: [], remember_turn=AsyncMock())
         gateway = FeishuGateway(model, memory, model._tools, send,

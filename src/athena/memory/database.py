@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from contextlib import closing
 from pathlib import Path
@@ -13,6 +13,7 @@ class StoredTurn:
     turn_id: UUID
     user_text: str
     assistant_text: str
+    started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,19 +72,21 @@ class MemoryDatabase:
                 """INSERT OR REPLACE INTO turns
                    (id, started_at, user_text, assistant_text, status)
                    VALUES (?, ?, ?, ?, 'completed')""",
-                (str(turn.turn_id), now, turn.user_text, turn.assistant_text),
+                (str(turn.turn_id), turn.started_at, turn.user_text, turn.assistant_text),
             )
             connection.commit()
 
     def recent_turns(self, limit: int = 10) -> list[StoredTurn]:
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                """SELECT id, user_text, assistant_text FROM turns
-                   WHERE status = 'completed' ORDER BY started_at DESC LIMIT ?""",
+                """SELECT id, user_text, assistant_text, started_at FROM turns
+                   WHERE status = 'completed' AND started_at > COALESCE(
+                       (SELECT value FROM memory_state WHERE key='context_cleared_at'), '')
+                   ORDER BY started_at DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
         rows.reverse()
-        return [StoredTurn(UUID(row[0]), row[1] or "", row[2] or "") for row in rows]
+        return [StoredTurn(UUID(row[0]), row[1] or "", row[2] or "", row[3]) for row in rows]
 
     def turns_between(self, start: datetime, end: datetime) -> list[StoredTurn]:
         """Completed turns inside a window, oldest first.
@@ -93,21 +96,22 @@ class MemoryDatabase:
         """
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                """SELECT id, user_text, assistant_text FROM turns
+                """SELECT id, user_text, assistant_text, started_at FROM turns
                    WHERE status = 'completed' AND started_at >= ? AND started_at < ?
+                   AND started_at > COALESCE((SELECT value FROM memory_state WHERE key='context_cleared_at'), '')
                    ORDER BY started_at ASC""",
                 (start.astimezone(timezone.utc).isoformat(),
                  end.astimezone(timezone.utc).isoformat()),
             ).fetchall()
-        return [StoredTurn(UUID(row[0]), row[1] or "", row[2] or "") for row in rows]
+        return [StoredTurn(UUID(row[0]), row[1] or "", row[2] or "", row[3]) for row in rows]
 
-    def recent_conversations(self, limit: int = 30) -> list[ConversationRow]:
+    def recent_conversations(self, limit: int = 30, offset: int = 0) -> list[ConversationRow]:
         limit = max(1, min(int(limit), 100))
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 """SELECT id, started_at, user_text, assistant_text FROM turns
-                   WHERE status = 'completed' ORDER BY started_at DESC LIMIT ?""",
-                (limit,),
+                   WHERE status = 'completed' ORDER BY started_at DESC LIMIT ? OFFSET ?""",
+                (limit, max(0, int(offset))),
             ).fetchall()
         return [ConversationRow(UUID(row[0]), row[1], row[2] or "", row[3] or "")
                 for row in rows]
@@ -241,3 +245,13 @@ class MemoryDatabase:
                 "SELECT value FROM memory_state WHERE key = ?", (key,)
             ).fetchone()
         return row[0] if row else ""
+
+    def clear_context(self) -> str:
+        """Reset the context boundary, retaining history and durable facts."""
+        stamp = datetime.now(timezone.utc).isoformat()
+        with closing(self._connect()) as connection:
+            connection.execute("INSERT INTO memory_state(key,value,updated_at) VALUES('context_cleared_at',?,?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (stamp, stamp))
+            connection.execute("DELETE FROM memory_state WHERE key='rolling_summary'")
+            connection.commit()
+        return stamp

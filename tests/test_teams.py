@@ -4,7 +4,9 @@ import unittest
 from unittest.mock import patch
 
 from athena.tools.teams import (
+    ASSIGNMENT_SCOPES,
     TeamsAssignmentsTool,
+    TeamsAuth,
     TeamsGraph,
     TeamsPostsTool,
 )
@@ -225,6 +227,7 @@ class _RecordingSession:
     calls: list = []
     headers_seen: list = []
     teams = [{"id": "team-1", "displayName": "Class"}]
+    classes: list = [{"id": "class-1", "displayName": "Physics"}]
     assignments: list = []
     closed = False
 
@@ -250,6 +253,8 @@ class _RecordingSession:
             return _RecordingResponse({"error": {"message": "Unauthorized"}}, status=401)
         if "education/me/assignments" in url:
             return _RecordingResponse({"value": list(_RecordingSession.assignments)})
+        if url.endswith("/education/me/classes"):
+            return _RecordingResponse({"value": list(_RecordingSession.classes)})
         if url.endswith("/me/joinedTeams"):
             return _RecordingResponse({"value": list(_RecordingSession.teams)})
         if url.endswith("/channels"):
@@ -448,6 +453,7 @@ class AssignmentOrderingTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         _RecordingSession.calls = []
+        _RecordingSession.classes = [{"id": "class-1", "displayName": "Physics"}]
         patcher = patch("athena.tools.teams.aiohttp.ClientSession", _RecordingSession)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -490,3 +496,144 @@ class AssignmentOrderingTests(unittest.IsolatedAsyncioTestCase):
         result = await tool.execute({})
         self.assertIn("Essay", result.spoken_text)
         self.assertIn("upcoming", result.spoken_text)
+
+
+class ClassFilterTests(unittest.IsolatedAsyncioTestCase):
+    """"Homework for Physics" was filtered with a team ID, which Graph rejects.
+
+    A class and a team are different objects. The roster comes from
+    /education/me/classes, and its ID is what /education/classes/{id} expects.
+    """
+
+    def setUp(self):
+        _RecordingSession.calls = []
+        _RecordingSession.classes = [{"id": "class-1", "displayName": "Physics"}]
+        _RecordingSession.assignments = []
+        patcher = patch("athena.tools.teams.aiohttp.ClientSession", _RecordingSession)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_a_class_filter_uses_the_class_roster_not_joined_teams(self):
+        now = datetime.now(timezone.utc)
+        _RecordingSession.assignments = [
+            {"id": "a1", "classId": "class-1", "displayName": "Optics lab",
+             "dueDateTime": (now + timedelta(days=1)).isoformat()},
+        ]
+        tool = TeamsAssignmentsTool(TeamsGraph(_Auth()))
+        result = await tool.execute({"class_name": "Physics"})
+        self.assertTrue(result.success, result.spoken_text)
+        class_calls = [url for url, _ in _RecordingSession.calls if "/education/classes/" in url]
+        self.assertTrue(class_calls, "the class-scoped endpoint was never called")
+        self.assertTrue(all("class-1" in url for url in class_calls),
+                        f"a non-class ID was sent: {class_calls}")
+
+    async def test_a_unique_partial_class_name_is_accepted(self):
+        _RecordingSession.classes = [
+            {"id": "class-1", "displayName": "Physics"},
+            {"id": "class-2", "displayName": "History"},
+        ]
+        tool = TeamsAssignmentsTool(TeamsGraph(_Auth()))
+        result = await tool.execute({"class_name": "phys"})
+        self.assertTrue(result.success, result.spoken_text)
+
+    async def test_an_unknown_class_lists_the_real_names(self):
+        _RecordingSession.classes = [{"id": "class-1", "displayName": "Physics"}]
+        tool = TeamsAssignmentsTool(TeamsGraph(_Auth()))
+        result = await tool.execute({"class_name": "Astronomy"})
+        self.assertFalse(result.success)
+        self.assertIn("Physics", result.spoken_text)
+
+    async def test_the_roster_is_fetched_without_top(self):
+        await TeamsGraph(_Auth()).classes()
+        for url, params in _RecordingSession.calls:
+            if url.endswith("/education/me/classes"):
+                self.assertIn(params, (None, {}), f"$top was sent to {url}")
+
+    async def test_the_roster_request_carries_a_token(self):
+        _RecordingSession.headers_seen = []
+        await TeamsGraph(_Auth()).classes()
+        self.assertTrue(_RecordingSession.headers_seen)
+        for headers in _RecordingSession.headers_seen:
+            self.assertIn("Authorization", headers)
+
+    async def test_edu_roster_is_requested_so_the_filter_can_work(self):
+        import os
+        import tempfile
+        with patch.dict(os.environ, {"MICROSOFT_CLIENT_ID": "client-id",
+                                     "ATHENA_DATA_DIR": tempfile.mkdtemp()}, clear=False):
+            self.assertIn("EduRoster.ReadBasic", TeamsAuth().scopes)
+
+    def test_the_roster_scope_is_not_part_of_the_default_assignment_token(self):
+        """An unfiltered "what is due" must not need the roster consent.
+
+        ASSIGNMENT_SCOPES is used to mint the token for plain assignment reads.
+        Leaving EduRoster.ReadBasic in it made every unfiltered read fail on a
+        token cached before that scope existed, which the live Pi run caught.
+        """
+        self.assertNotIn("EduRoster.ReadBasic", ASSIGNMENT_SCOPES)
+        self.assertEqual(ASSIGNMENT_SCOPES, ["User.Read", "EduAssignments.Read"])
+
+    async def test_the_roster_is_fetched_with_the_roster_scope(self):
+        """classes() must ask for the roster scope on top of the base scopes."""
+        seen = []
+
+        class _Auth:
+            def token(self, scopes=None):
+                seen.append(list(scopes or []))
+                return "token"
+
+        with patch("athena.tools.teams.aiohttp.ClientSession", _RecordingSession):
+            graph = TeamsGraph(_Auth())
+            await graph.classes()
+        self.assertTrue(seen, "no token was requested")
+        for scopes in seen:
+            self.assertIn("EduRoster.ReadBasic", scopes)
+            self.assertIn("EduAssignments.Read", scopes)
+
+    async def test_no_class_filter_still_works_when_the_roster_is_denied(self):
+        """An unfiltered "what is due" must not break on a missing consent."""
+        now = datetime.now(timezone.utc)
+        _RecordingSession.assignments = [
+            {"displayName": "Essay", "dueDateTime": (now + timedelta(days=1)).isoformat()},
+        ]
+
+        class DeniedRoster(_RecordingSession):
+            def get(self, url, params=None, **kwargs):
+                if url.endswith("/education/me/classes"):
+                    return _RecordingResponse({"error": {"message": "denied"}}, status=403)
+                return super().get(url, params, **kwargs)
+
+        with patch("athena.tools.teams.aiohttp.ClientSession", DeniedRoster):
+            tool = TeamsAssignmentsTool(TeamsGraph(_Auth()))
+            result = await tool.execute({})
+        self.assertTrue(result.success, result.spoken_text)
+        self.assertIn("Essay", result.spoken_text)
+
+    async def test_a_class_filter_reports_the_missing_roster_consent(self):
+        class DeniedRoster(_RecordingSession):
+            def get(self, url, params=None, **kwargs):
+                if url.endswith("/education/me/classes"):
+                    return _RecordingResponse({"error": {"message": "denied"}}, status=403)
+                return super().get(url, params, **kwargs)
+
+        with patch("athena.tools.teams.aiohttp.ClientSession", DeniedRoster):
+            tool = TeamsAssignmentsTool(TeamsGraph(_Auth()))
+            result = await tool.execute({"class_name": "Physics"})
+        self.assertFalse(result.success)
+        self.assertIn("EduRoster.ReadBasic", result.spoken_text)
+
+    async def test_student_can_filter_own_work_when_roster_and_class_access_are_denied(self):
+        class StudentGraph:
+            async def classes(self): raise RuntimeError('Missing EduRoster.ReadBasic')
+            async def get(self, path):
+                if path == '/me/joinedTeams':
+                    return {'value': [{'id': 'physics', 'displayName': 'AP Physics'}]}
+                raise RuntimeError('Class detail denied')
+            async def assignments(self, limit, class_id=None):
+                if class_id: raise RuntimeError('Class assignments denied')
+                return [{'id': '1', 'classId': 'math', 'displayName': 'Math worksheet'},
+                        {'id': '2', 'classId': 'physics', 'displayName': 'Optics lab'}]
+        result = await TeamsAssignmentsTool(StudentGraph()).execute({'class_name': 'physics'})
+        self.assertTrue(result.success, result.spoken_text)
+        self.assertIn('Optics lab', result.spoken_text)
+        self.assertNotIn('Math worksheet', result.spoken_text)

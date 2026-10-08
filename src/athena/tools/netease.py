@@ -319,7 +319,9 @@ class NetEasePlayer:
             async with httpx.AsyncClient(timeout=12, headers={"User-Agent": "Mozilla/5.0"}) as client:
                 response = await client.get(url, params={"s": query, "type": 1, "limit": 5, "offset": 0})
                 response.raise_for_status()
-                songs = response.json().get("result", {}).get("songs", [])
+                payload = response.json()
+                result = payload.get("result") if isinstance(payload, dict) else None
+                songs = result.get("songs", []) if isinstance(result, dict) else []
         except (httpx.HTTPError, ValueError) as error:
             raise RuntimeError(f"NetEase Music search failed: {error}") from None
         results = []
@@ -368,7 +370,9 @@ class NetEasePlayer:
             if self.speaker is None:
                 raise RuntimeError("No ATHENA audio output is available.")
             if getattr(self.speaker, "available", True) is False:
-                raise RuntimeError("No computer browser is connected for audio. Open the dashboard and press Start.")
+                raise RuntimeError(
+                    "No audio output is available for music right now, and the Pi's "
+                    "own speaker could not be opened either.")
             await self.stop()
             self.queue = await self._search(query)
             self.last_error = ""
@@ -416,10 +420,10 @@ class NetEasePlayer:
                         continue
                     chunk = bytes(pending[:aligned])
                     del pending[:aligned]
-                    self._started.set()
                     pcm = self._apply_volume(chunk)
                     if not await self._play_music_chunk(pcm, rate, channels, generation, describes_itself):
                         break
+                    self._started.set()
                 await self.process.communicate()
                 self.process = None
         except asyncio.CancelledError:

@@ -50,13 +50,10 @@ from athena.events import AudioChunk
 # Edge's neural voices are 24 kHz mono, matching the cloud voice's rate.
 SAMPLE_RATE = 24_000
 
-# Jenny is the default because it is the only voice measured here that is both
-# warm and as fast as the old neutral one. It is tagged "Friendly, Considerate,
-# Comfort" and reached first audio in ~890 ms, the same as Aria's ~900 ms, so the
-# warmth is free. Ava is the most expressive voice Edge offers ("Expressive,
-# Caring, Pleasant, Friendly") but costs roughly +430 ms to first audio, so it is
-# the choice to make deliberately rather than the default.
-DEFAULT_VOICE = "en-US-JennyNeural"
+# Ava is Edge's most expressive English voice. The user explicitly prefers
+# emotion; its slightly slower first byte is offset by keeping clauses longer
+# and avoiding an Edge connection at every comma.
+DEFAULT_VOICE = "en-US-AvaNeural"
 
 # How much decoded PCM to hand over at a time, matching the other backends so the
 # speaker sees the same cadence regardless of which voice is configured.
@@ -108,13 +105,24 @@ def decoder_command(sample_rate: int | None = None) -> list[str]:
     """
     rate = sample_rate or edge_sample_rate()
     return [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        decoder_binary() or "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "mp3", "-probesize", "32", "-analyzeduration", "0",
         "-i", "pipe:0",
         "-f", "s16le", "-acodec", "pcm_s16le",
         "-ar", str(rate), "-ac", "1",
         "pipe:1",
     ]
+
+
+def decoder_binary() -> str | None:
+    executable = shutil.which('ffmpeg')
+    if executable:
+        return executable
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, RuntimeError, OSError):
+        return None
 
 
 def edge_available() -> tuple[bool, str]:
@@ -127,8 +135,8 @@ def edge_available() -> tuple[bool, str]:
         import edge_tts  # noqa: F401
     except ImportError:
         return False, "edge-tts is not installed (pip install edge-tts)"
-    if shutil.which("ffmpeg") is None:
-        return False, "ffmpeg is not installed, and Edge returns MP3 (apt install ffmpeg)"
+    if decoder_binary() is None:
+        return False, "ffmpeg is not installed, and Edge returns MP3 (install ffmpeg or imageio-ffmpeg)"
     return True, ""
 
 
@@ -152,7 +160,8 @@ class EdgeSynthesizer:
     def __init__(self, voice: str | None = None, rate: str | None = None,
                  pitch: str | None = None, settings=None,
                  sample_rate: int | None = None) -> None:
-        self._voice = voice or edge_voice()
+        selected = settings.get('edge_voice') if settings is not None else 'system'
+        self._voice = voice or (selected if selected != 'system' else edge_voice())
         self._rate = rate or edge_rate()
         self._pitch = pitch or edge_pitch()
         self._settings = settings

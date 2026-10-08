@@ -1,0 +1,41 @@
+name: Build installers
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install . pyinstaller
+      - name: Install verified compiler
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe -OutFile compiler.exe
+          if ((Get-AuthenticodeSignature compiler.exe).Status -ne 'Valid') { throw 'Invalid compiler signature' }
+          Start-Process .\compiler.exe -ArgumentList '/CURRENTUSER','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\Inno' -Wait
+      - run: python packaging/build.py --windows --iscc C:/Inno/ISCC.exe
+      - run: python tools/check_installers.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: dist/installers/*
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python packaging/build.py --linux
+      - run: bash dist/installers/ATHENA-Linux-Setup.run --check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-installer
+          path: dist/installers/*

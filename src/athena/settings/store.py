@@ -83,6 +83,12 @@ CATALOG: dict[str, SettingSpec] = {
         str,
         choices=("Neil", "Cherry", "Dolce", "Ethan", "Serena", "Chelsie"),
     ),
+    "edge_voice": SettingSpec(
+        "system",
+        "Edge speaking voice. Ava is the most expressive; system uses ATHENA_EDGE_VOICE.",
+        str,
+        choices=("system", "en-US-AvaNeural", "en-US-JennyNeural", "en-US-AriaNeural"),
+    ),
     "tts_speech_rate": SettingSpec(
         1.2, "Speaking speed: 1.0 is normal, 1.2 is twenty percent faster.",
         float, 0.5, 2.0, live=True

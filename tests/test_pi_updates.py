@@ -30,6 +30,25 @@ updater = load('athena_pi_updater', PROJECT / 'orange_pi' / 'pi' / 'update_clien
 class PiUpdateTests(unittest.TestCase):
     KEY = b'test-update-key-that-is-longer-than-thirty-two-bytes'
 
+    def test_feed_discovery_requires_signature_and_recovers_changed_address(self):
+        from urllib.parse import urlsplit
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = publisher.build_release(PROJECT, Path(directory), 'discovery-test', self.KEY)
+            def fetch(url, maximum, timeout=20):
+                host = urlsplit(url).hostname
+                if host == '192.168.33.186':
+                    return json.dumps(manifest).encode()
+                if host == '192.168.33.188':
+                    return json.dumps(dict(manifest, signature='0' * 64)).encode()
+                raise OSError('offline')
+            with patch.object(updater, 'fetch', side_effect=fetch):
+                url, found = updater.discover_feed('http://192.168.33.187:8765/', self.KEY)
+            self.assertEqual(url, 'http://192.168.33.186:8765/')
+            self.assertEqual(found['version'], 'discovery-test')
+            with patch.object(updater, 'fetch', return_value=json.dumps(dict(manifest, signature='0' * 64)).encode()):
+                with self.assertRaises(ConnectionError):
+                    updater.discover_feed('http://192.168.33.187:8765/', self.KEY)
+
     def test_signed_release_contains_only_runtime_and_uses_manifest_version(self):
         with tempfile.TemporaryDirectory() as directory:
             feed = Path(directory) / 'feed'

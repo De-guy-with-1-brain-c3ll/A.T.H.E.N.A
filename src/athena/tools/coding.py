@@ -108,6 +108,8 @@ class CodingWorkspaceTool:
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(content, encoding="utf-8")
                     self.last_artifact = str(path)
+                    from athena.artifacts import remember_artifact
+                    remember_artifact(path, self.root.parent)
                     return ToolResult(True, "I saved the program file; it has not been tested yet.", {"path": str(path), "bytes": len(content.encode()), "tested": False})
                 if action not in {"check", "test", "run"}:
                     return ToolResult(False, "Unsupported coding action.")
@@ -119,8 +121,14 @@ class CodingWorkspaceTool:
                 result = await self.runner(files, action, entrypoint, arguments.get("args", []), arguments.get("timeout", 20))
                 passed = bool(result.get("success"))
                 result["untrusted_content"] = True
+                if not passed and (result.get('error') == 'sandbox_unavailable' or
+                                   result.get('sandbox') == 'docker' and result.get('exit_code') == 125):
+                    message = result.get('message') or result.get('hint') or (
+                        'The coding sandbox is unavailable. Start Docker and ensure the python:3.12-slim image is installed.')
+                else:
+                    message = result.get('message', f"The {action} failed. Inspect the test output before claiming success.")
                 return ToolResult(passed,
-                    f"The {action} completed successfully." if passed else result.get("message", f"The {action} failed. Inspect the test output before claiming success."), result)
+                    f"The {action} completed successfully." if passed else message, result)
             except (ValueError, OSError, UnicodeError) as error:
                 return ToolResult(False, f"Coding request rejected: {error}")
 

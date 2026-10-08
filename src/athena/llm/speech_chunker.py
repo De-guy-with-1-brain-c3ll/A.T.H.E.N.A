@@ -8,7 +8,7 @@ class SpeechChunker:
 
     _ending = re.compile(r"[.!?;](?:[\"')\]]+)?\s*$")
 
-    def __init__(self, comma_threshold: int = 24, hard_limit: int = 70) -> None:
+    def __init__(self, comma_threshold: int = 24, hard_limit: int = 140) -> None:
         self._buffer = ""
         self._comma_threshold = comma_threshold
         self._hard_limit = hard_limit
@@ -36,10 +36,13 @@ class SpeechChunker:
             if character == "." and index and self._buffer[index - 1].isdigit():
                 if index + 1 == len(self._buffer) or self._buffer[index + 1].isdigit():
                     continue
+                if re.search(r"(?:^|\n)\s*\d+\.$", self._buffer[:index + 1]):
+                    continue
             if character in ".!?;。！？；" and index + 1 >= 2:
                 return index + 1
-            if character in ",，" and index + 1 >= self._comma_threshold:
-                return index + 1
+            # Edge spends another network round trip for every clause. A comma
+            # is not a sentence boundary, and splitting lists here introduced
+            # long artificial pauses even though speech_text removes commas.
         if len(self._buffer) < self._hard_limit:
             return None
         boundary = self._buffer.rfind(" ", 0, self._hard_limit + 1)

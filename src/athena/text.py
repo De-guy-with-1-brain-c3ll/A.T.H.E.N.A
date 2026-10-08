@@ -124,7 +124,8 @@ async def run(message: str | None = None) -> int:
                         short = str(job.id)[:8]
                         if acknowledgement:
                             job.acknowledged = True
-                            print(f"\nATHENA [{short}]: Still working in the background.")
+                            # Timer ticks are not new information. Completion,
+                            # failure and real task events are delivered separately.
                         else:
                             print(f"\nATHENA [{short}]: {job.reply}")
                             await session.remember_job(job)

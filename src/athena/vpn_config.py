@@ -3,7 +3,7 @@ import hashlib
 from urllib.parse import urlsplit
 import yaml
 
-DIRECT_DOMAINS = ("deepseek.com", "aliyuncs.com", "aliyun.com", "alibabacloud.com", "qwen.ai", "qwenlm.ai")
+DIRECT_DOMAINS = ("deepseek.com", "aliyuncs.com", "aliyun.com", "alibabacloud.com", "qwen.ai", "qwenlm.ai", "163.com", "126.net")
 LAN_RANGES = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")
 
 def compile_config(text, secret):

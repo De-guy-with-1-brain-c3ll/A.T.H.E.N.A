@@ -200,12 +200,13 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success)
         self.assertTrue(registry.shutdown_requested)
 
-    async def test_shutdown_bypasses_model_and_coordinator_exits_after_goodbye(self):
+    async def test_shutdown_is_model_selected_and_coordinator_exits_after_goodbye(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = RuntimeSettingsStore(Path(directory) / 'settings.json')
             registry = ToolRegistry.discover()
             model = DeepSeekLanguageModel('test-key', 'test-model', registry, settings)
-            model._client.chat.completions.create = AsyncMock()
+            from tests.test_search_refinement import call
+            model._client.chat.completions.create = AsyncMock(return_value=call('shutdown_athena', {}, 'shutdown'))
             coordinator = VoiceCoordinator(MagicMock(), MagicMock(), MagicMock(), model,
                                            MagicMock(), MagicMock(), MagicMock(), settings)
             coordinator._listen = AsyncMock(return_value='shut down athena')
@@ -215,7 +216,7 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
             coordinator._answer = AsyncMock(side_effect=answer)
             try:
                 await coordinator.run()
-                model._client.chat.completions.create.assert_not_called()
+                model._client.chat.completions.create.assert_awaited_once()
             finally:
                 await model.close()
             self.assertEqual(coordinator._listen.await_count, 1)

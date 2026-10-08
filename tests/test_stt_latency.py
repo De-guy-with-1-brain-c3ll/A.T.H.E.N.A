@@ -161,6 +161,9 @@ class RecognizerLatencyTests(unittest.IsolatedAsyncioTestCase):
         await recognizer.start_turn(turn)
         await recognizer.send_audio(b"\x11\x22" * 10)
         active = FakeRecognition.instances[-1]
+        self.assertEqual(len(FakeRecognition.instances), 2,
+                         'The in-flight prewarm should be reused, not followed by another handshake')
+        self.assertEqual(recognizer.reused_sessions, 2)
         self.assertEqual(active.frames, [b"\x11\x22" * 10])
         self.assertEqual(active.kwargs["callback"].turn_id, turn)
 

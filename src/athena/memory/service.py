@@ -51,6 +51,8 @@ class MemoryService:
         self._queue: asyncio.Queue[StoredTurn] = asyncio.Queue(maxsize=32)
         self._recent: deque[StoredTurn] = deque(maxlen=8)
         self._summary = ""
+        self._context_revision = ""
+        self._context_ready = False
         self._facts: list[tuple[str, str, float]] = []
         self._worker_task: asyncio.Task | None = None
         self._concentration_calls = 0
@@ -61,6 +63,8 @@ class MemoryService:
 
     async def connect(self) -> None:
         await asyncio.to_thread(self._database.initialize)
+        self._context_revision = self._database.state_value('context_cleared_at')
+        self._context_ready = True
         recent, summary, facts = await asyncio.gather(
             asyncio.to_thread(self._database.recent_turns, 8),
             asyncio.to_thread(self._database.get_summary),
@@ -76,6 +80,7 @@ class MemoryService:
         self._worker_task = asyncio.create_task(self._worker())
 
     def context_messages(self, *, max_turns: int = 8, max_chars: int = 8_000) -> list[dict[str, str]]:
+        self._sync_context()
         if self._settings is not None and not self._settings.get("memory_enabled"):
             return []
         messages: list[dict[str, str]] = []
@@ -111,9 +116,19 @@ class MemoryService:
             used += len(user) + len(assistant)
         return messages
 
+    def _sync_context(self) -> None:
+        if not self._context_ready:
+            return
+        revision = self._database.state_value('context_cleared_at')
+        if revision != self._context_revision:
+            self._context_revision = revision
+            self._recent.clear()
+            self._summary = ''
+
     async def remember_turn(
         self, turn_id: UUID, user_text: str, assistant_text: str
     ) -> None:
+        self._sync_context()
         if self._settings is not None and not self._settings.get("memory_enabled"):
             return
         if _SECRET_VALUE.search(user_text) or _SECRET_VALUE.search(assistant_text):
@@ -152,6 +167,7 @@ class MemoryService:
         pending_summary: list[StoredTurn] = []
         while True:
             first = await self._queue.get()
+            revision = self._context_revision
             batch = [first]
             try:
                 await asyncio.sleep(self._batch_delay)
@@ -161,7 +177,11 @@ class MemoryService:
                 pass
             try:
                 await self._save_batch(batch)
-                pending_summary.extend(batch)
+                self._sync_context()
+                if revision != self._context_revision:
+                    pending_summary.clear()
+                    continue
+                pending_summary.extend(turn for turn in batch if turn.started_at > self._context_revision)
                 batch_size = (self._settings.get("memory_summary_batch_size")
                               if self._settings is not None else 6)
                 while len(pending_summary) >= batch_size:
@@ -175,6 +195,10 @@ class MemoryService:
                     self._queue.task_done()
 
     async def _concentrate(self, turns: list[StoredTurn]) -> None:
+        revision = self._database.state_value('context_cleared_at')
+        turns = [turn for turn in turns if turn.started_at > revision]
+        if not turns:
+            return
         self._concentration_calls += 1
         conversation = "\n\n".join(
             f"TURN {turn.turn_id}\nUSER: {turn.user_text}\nATHENA: {turn.assistant_text}"
@@ -222,6 +246,9 @@ class MemoryService:
             raise ValueError(f"memory model returned invalid JSON twice: {last_error}")
         # The same gate sleep mode uses, in one place: sensitive data, the quality
         # rules, and the cap on how large the table may grow.
+        if revision != self._database.state_value('context_cleared_at'):
+            self._sync_context()
+            return
         applied = await apply_result(self._database, result, turns[-1].turn_id)
         if applied.summary_chars:
             self._summary = await asyncio.to_thread(self._database.get_summary)

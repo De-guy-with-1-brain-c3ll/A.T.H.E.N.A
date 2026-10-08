@@ -30,6 +30,10 @@ class PCBrowserTool:
                     return ToolResult(False, result["navigation_error"], result)
                 if action == "status" and result.get("navigation_state") == "opening":
                     return ToolResult(True, f"Still opening {result['target_url']}; loading is not confirmed yet.", result)
+                if action == "open":
+                    if result.get('opened_external'):
+                        return ToolResult(True, f"I launched {result['url']} in your PC's default browser. I can't inspect that external tab.", result)
+                    return ToolResult(True, f"Opened {result.get('title') or result.get('url') or arguments['url']} on your PC.", result)
                 return ToolResult(True, "PC browser action completed." if action != "status" else
                                   f"PC browser {'is open' if result['running'] else 'is closed'}; keyboard control {'enabled' if result['keyboard_enabled'] else 'disabled'}.", result)
             key = os.environ.get("DASHSCOPE_API_KEY", "")

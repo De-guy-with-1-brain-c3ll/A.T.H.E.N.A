@@ -8,12 +8,14 @@ import ipaddress
 import os
 from pathlib import Path
 import re
+import socket
 import time
 import json
 import logging
 from uuid import uuid4
 
 from aiohttp import web
+from athena.pc_discovery import proof
 
 MAX_BYTES = 25 * 1024 * 1024
 
@@ -28,6 +30,17 @@ def inbox_app(inbox, key, browser=None):
     inbox = Path(inbox).resolve()
     inbox.mkdir(parents=True, exist_ok=True)
     seen = {}
+
+    async def identify(request):
+        try:
+            address = ipaddress.ip_address(request.remote)
+            nonce = request.query.get("nonce", "")
+            if not (address.is_private or address.is_loopback) or not re.fullmatch(r"[a-f0-9]{32}", nonce):
+                raise ValueError()
+        except ValueError:
+            raise web.HTTPForbidden(text="Invalid LAN challenge.") from None
+        return web.json_response({"service": "athena-pc-inbox", "nonce": nonce,
+                                  "proof": proof(key, nonce)})
 
     async def receive(request):
         try:
@@ -98,6 +111,7 @@ def inbox_app(inbox, key, browser=None):
             temporary.unlink(missing_ok=True)
 
     app = web.Application(client_max_size=MAX_BYTES)
+    app.router.add_get("/identify", identify)
     app.router.add_post("/upload", receive)
     app.router.add_post("/browser", receive)
     if browser is not None:
@@ -106,14 +120,109 @@ def inbox_app(inbox, key, browser=None):
     return app
 
 
+def _default_route_address() -> str:
+    """The local address outbound traffic would leave this computer from."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        return probe.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        probe.close()
+
+
+def lan_address() -> str:
+    """This computer's own LAN IPv4, worked out without asking.
+
+    DHCP hands out a new address now and then while the Pi keeps pointing at
+    the old one, and a hard-coded bind address is therefore a trap: it fails
+    with a bare "could not bind on any address". So the address is discovered
+    rather than pinned.
+
+    A connected UDP socket only asks the routing table which source address it
+    would pick, and on this machine that is answered by the virtual adapters
+    that sit above the real network — the VPN and the proxy both answer here,
+    and binding one of those means the Pi can never reach the receiver. The
+    default route is therefore only a hint: anything it names that is not also
+    a real interface address is ignored, because it cannot be bound.
+    """
+    bound = {info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None,
+                                                        socket.AF_INET, socket.SOCK_STREAM)}
+    preferred = _default_route_address()
+    if preferred in bound and not _is_virtual(preferred):
+        return preferred
+    candidates = [address for address in bound
+                  if _usable(address) and not _is_virtual(address)]
+    if not candidates:
+        candidates = [address for address in bound if _usable(address)]
+    if not candidates:
+        raise RuntimeError(
+            "This computer has no private IPv4 address for the Pi to reach. Connect it "
+            "to the same network as the Orange Pi and try again.")
+    if preferred and preferred in candidates:
+        return preferred
+    return candidates[0]
+
+
+def _usable(address: str) -> bool:
+    parsed = ipaddress.ip_address(address)
+    return parsed.is_private and not (parsed.is_loopback or parsed.is_link_local)
+
+
+def _is_virtual(address: str) -> bool:
+    """Whether the address belongs to a tunnel or proxy rather than a real LAN.
+
+    A proxy client installs its own adapter and takes the default route, so it
+    is the address that must never be chosen here: the Orange Pi has no route
+    to it. Real adapters are named for what they are — WLAN, Ethernet, Wi-Fi —
+    and anything else is treated as a tunnel, because the only addresses worth
+    binding are the ones on the network the Pi is also on.
+    """
+    real = ("wlan", "wifi", "wi-fi", "ethernet", "eth", "en0", "en1",
+            "无线", "以太网")
+    tunnel = ("loopback", "tunnel", "teredo", "vmware", "virtual", "vpn", "wsl",
+              "bluetooth", "pseudo", "clash", "proxy", "tap", "tap-windows",
+              "zerotier", "tailscale", "npcap", "sing-box", "v2ray", "mihomo")
+    try:
+        import psutil
+    except ImportError:
+        return False
+    for name, addresses in psutil.net_if_addrs().items():
+        if not any(entry.address == address for entry in addresses):
+            continue
+        lowered = name.casefold()
+        # Tunnel names are checked first on purpose: "vEthernet (WSL)" contains
+        # "ethernet", so a real-adapter test that ran first would wave a
+        # virtual switch through as a real LAN.
+        if any(marker in lowered for marker in tunnel):
+            return True
+        if any(marker in lowered for marker in real):
+            return False
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bind", default="127.0.0.1", help="Use your PC's LAN IPv4 address for Pi access.")
+    parser.add_argument("--bind", default="127.0.0.1",
+                        help="LAN IPv4 to serve on, or 'auto' to detect it.")
     parser.add_argument("--port", type=int, default=8781)
     parser.add_argument("--inbox", type=Path, default=Path.cwd() / "ATHENA Inbox")
     args = parser.parse_args()
+    if args.bind.strip().casefold() == "auto":
+        args.bind = lan_address()
+        print(f"Serving on the LAN address this computer uses to reach the Pi: {args.bind}")
     if not ipaddress.ip_address(args.bind).is_private:
         parser.error("Bind to a private LAN address or localhost, not a public interface.")
+    # An address this machine no longer has fails with a bare "could not bind
+    # on any address", so the addresses it actually has are named instead.
+    local = {info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None,
+                                                       socket.AF_INET, socket.SOCK_STREAM)}
+    if not ipaddress.ip_address(args.bind).is_loopback and args.bind not in local and args.bind != lan_address():
+        parser.error(
+            f"This computer does not have {args.bind} any more. Its current IPv4 "
+            f"addresses are {', '.join(sorted(local)) or '(none found)'}. Re-run with "
+            f"--bind auto, or with one of those addresses.")
     from athena.pc_browser import PCBrowser
     browser = PCBrowser(args.inbox.parent / "data" / "pc-browser-profile")
     web.run_app(inbox_app(args.inbox, os.environ.get("ATHENA_PC_TRANSFER_KEY", ""), browser),

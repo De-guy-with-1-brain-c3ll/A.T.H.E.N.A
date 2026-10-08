@@ -35,6 +35,10 @@ DEFAULT_SCOPES = [
     "Channel.ReadBasic.All",
     "ChannelMessage.Read.All",
     "EduAssignments.Read",
+    # Resolving "homework for Physics" needs the education class roster. It is a
+    # different collection from joinedTeams, and its IDs are what the assignments
+    # endpoint is keyed on, so EduRoster.ReadBasic is what makes the filter work.
+    "EduRoster.ReadBasic",
     # Communication Journal posts are often a photo of the day's notes rather
     # than text, and the image lives in the team's SharePoint library. Without
     # this the post can only be reported as an unreadable attachment.
@@ -198,6 +202,8 @@ class TeamsGraph:
         self._teams: list[dict[str, Any]] = []
         self._teams_at = 0.0
         self._channels: dict[str, tuple[list[dict[str, Any]], float]] = {}
+        self._classes: list[dict[str, Any]] = []
+        self._classes_at = 0.0
 
     async def _access_token(self, scopes: list[str] | None = None) -> str:
         key = tuple(scopes or self.auth.scopes)
@@ -265,6 +271,47 @@ class TeamsGraph:
         self._teams_at = time.monotonic()
         return self._teams
 
+    async def classes(self) -> list[dict[str, Any]]:
+        """The education classes the signed-in student is enrolled in.
+
+        This is deliberately not ``joined_teams``. A class name and a team name
+        look alike but are different objects with different IDs, and the
+        assignments endpoint is keyed on the class ID — feeding it a team ID is
+        what made "homework for Physics" fail with an opaque Graph error.
+        """
+        if self._classes and time.monotonic() - self._classes_at < RESOLUTION_CACHE_SECONDS:
+            return self._classes
+        session = await self._client()
+        # Only the roster needs EduRoster.ReadBasic, so it is requested here and
+        # not in ASSIGNMENT_SCOPES. Putting it there made every unfiltered
+        # "what is due" fail on a token minted before the roster scope existed,
+        # which is the opposite of the graceful fallback this is meant to give.
+        headers = {"Authorization": f"Bearer {await self._access_token(ASSIGNMENT_SCOPES + ['EduRoster.ReadBasic'])}"}
+        # $top is rejected by this endpoint with HTTP 400, same as channels.
+        async with session.get(GRAPH + "/education/me/classes", headers=headers) as response:
+            body = await response.text()
+            if response.status >= 400:
+                if response.status in {401, 403}:
+                    raise RuntimeError(
+                        "Microsoft denied class access. Ask your admin to grant "
+                        "EduRoster.ReadBasic, then sign in to Teams again.")
+                explanation = ""
+                try:
+                    explanation = str(json.loads(body).get("error", {}).get("message") or "")[:300]
+                except ValueError:
+                    pass
+                raise RuntimeError(
+                    "Microsoft Graph returned HTTP "
+                    f"{response.status} for /education/me/classes."
+                    + (f" {explanation}" if explanation else ""))
+            try:
+                data = json.loads(body)
+            except ValueError:
+                raise RuntimeError("Microsoft Graph returned invalid data.") from None
+        self._classes = data.get("value", [])
+        self._classes_at = time.monotonic()
+        return self._classes
+
     async def team_channels(self, team_id: str) -> list[dict[str, Any]]:
         cached = self._channels.get(team_id)
         if cached and cached[1] > time.monotonic():
@@ -308,11 +355,11 @@ class TeamsGraph:
             except ValueError:
                 raise RuntimeError("Microsoft Graph returned invalid data.") from None
 
-    async def assignments(self, limit: int) -> list[dict[str, Any]]:
+    async def assignments(self, limit: int, class_id: str | None = None) -> list[dict[str, Any]]:
         # Graph can paginate this collection even when `$top` is supplied.
         # Follow nextLink so older/nearer assignments are not silently omitted.
         rows: list[dict[str, Any]] = []
-        url: str | None = "/education/me/assignments"
+        url: str | None = f"/education/classes/{quote(class_id, safe='')}/assignments" if class_id else "/education/me/assignments"
         params: dict[str, str] | None = {
             "$top": "100",
             "$orderby": "dueDateTime",
@@ -332,12 +379,19 @@ class TeamsGraph:
                             "Microsoft denied assignment access. Check EduAssignments.Read "
                             "consent, then sign in to Teams again."
                         )
-                    raise RuntimeError(f"Microsoft Graph returned HTTP {response.status}.")
+                    try:
+                        explanation = str(json.loads(body).get('error', {}).get('message') or '')[:300]
+                    except ValueError:
+                        explanation = ''
+                    raise RuntimeError(f"Microsoft Graph returned HTTP {response.status}. {explanation}".strip())
                 try:
                     data = json.loads(body)
                 except ValueError:
                     raise RuntimeError("Microsoft Graph returned invalid data.") from None
             rows.extend(data.get("value", []))
+            if class_id:
+                for row in rows:
+                    row.setdefault('classId', class_id)
             url = data.get("@odata.nextLink")
             params = None  # nextLink already contains its query string
         # `$orderby=dueDateTime` is ascending, so taking the first `limit` rows
@@ -425,9 +479,11 @@ class TeamsGraph:
 class TeamsAssignmentsTool:
     definition = ToolDefinition(
         name="teams_assignments",
-        description="Read the user's Microsoft Teams education assignments and due dates. Read-only.",
-        parameters={"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}}, "additionalProperties": False},
-        timeout_seconds=25,
+        description="Read actual homework/assignments and due dates from Microsoft Teams education. Optionally filter a class by name, such as Physics. Also returns instructions for the first three assignments when available. Read-only.",
+        parameters={"type": "object", "properties": {
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+            "class_name": {"type": "string", "minLength": 1, "maxLength": 120}}, "additionalProperties": False},
+        timeout_seconds=45,
     )
 
     def __init__(self, graph=None): self.graph = graph or TeamsGraph()
@@ -437,7 +493,48 @@ class TeamsAssignmentsTool:
 
     async def execute(self, arguments):
         try:
-            items = await self.graph.assignments(arguments.get("limit", 50))
+            roster = []
+            roster_error = None
+            if hasattr(self.graph, 'classes'):
+                try:
+                    roster = await self.graph.classes()
+                except (RuntimeError, aiohttp.ClientError, TimeoutError) as error:
+                    roster_error = str(error)
+                    # Without the roster a class filter cannot be resolved, but an
+                    # unfiltered "what is due" still can — so only a request that
+                    # actually asked for a class is allowed to fail here.
+                    if arguments.get('class_name'):
+                        roster = (await self.graph.get('/me/joinedTeams')).get('value', [])
+            chosen = None
+            if arguments.get('class_name'):
+                chosen = match_by_name(roster, arguments['class_name'])
+                if chosen is None:
+                    if roster_error:
+                        return ToolResult(False, roster_error + ' I also could not match that class in your joined teams.')
+                    return ToolResult(False, 'I could not identify that class uniquely. Your classes are ' +
+                        '; '.join(str(row.get('displayName')) for row in roster) + '.', {'classes': roster})
+            if chosen:
+                try:
+                    items = await self.graph.assignments(arguments.get('limit', 50), class_id=chosen['id'])
+                except RuntimeError:
+                    # Student tokens may list their own work but cannot list
+                    # the class collection. Filter the authenticated own-work
+                    # collection locally, before applying the requested limit.
+                    items = [row for row in await self.graph.assignments(2000)
+                             if row.get('classId') == chosen['id']][:arguments.get('limit', 50)]
+            else:
+                items = await self.graph.assignments(arguments.get('limit', 50))
+            names = {row['id']: row.get('displayName') for row in roster}
+            # The all-user listing intentionally omits instructions in Graph.
+            # Read the class detail for the first few items instead of inventing
+            # homework content from the assignment title.
+            details = {}
+            if hasattr(self.graph, 'get'):
+                eligible = [item for item in items[:3] if item.get('classId') and item.get('id')]
+                fetched = await asyncio.gather(*(self.graph.get(
+                    f"/education/classes/{quote(item['classId'], safe='')}/assignments/{quote(item['id'], safe='')}")
+                    for item in eligible), return_exceptions=True)
+                details = {item['id']: value for item, value in zip(eligible, fetched) if isinstance(value, dict)}
             now = datetime.now(timezone.utc)
             rows = []
             for item in items:
@@ -449,20 +546,42 @@ class TeamsAssignmentsTool:
                     "overdue": bool(due and due < now),
                     "status": item.get("status"),
                     "class_id": item.get("classId"),
+                    "class_name": names.get(item.get('classId')),
+                    "instructions": unescape(_HTML_TAG.sub(' ', str((details.get(item.get('id'), {}).get('instructions') or {}).get('content') or '')))[:3000].strip(),
                     "id": item.get("id"),
                 })
             if not rows:
                 return ToolResult(True, "You have no Teams assignments right now.",
                                   {"assignments": []})
             upcoming = [row for row in rows if not row["overdue"]]
-            # A bare count was useless to speak aloud, so name the next one.
-            head = upcoming[0] if upcoming else rows[0]
-            due = head["due"][:10] if head["due"] else "no due date"
-            state = f"{len(upcoming)} still upcoming" if upcoming else "all past due"
+            # Give the voice a short natural overview. Raw ISO dates and a
+            # count followed by "Next:" sounded like reading a database row.
+            from zoneinfo import ZoneInfo
+            try:
+                zone = ZoneInfo(os.environ.get('ATHENA_TIMEZONE', 'Asia/Shanghai'))
+            except Exception:
+                zone = timezone.utc
+            def speakable(row):
+                due = parse_due(row['due'])
+                if due is None:
+                    timing = 'has no due date listed'
+                else:
+                    local = due.astimezone(zone)
+                    today = now.astimezone(zone).date()
+                    day = ('today' if local.date() == today else 'tomorrow'
+                           if (local.date() - today).days == 1 else
+                           f'on {local:%A, %B} {local.day}')
+                    timing = f"{'was' if row['overdue'] else 'is'} due {day} at {local.strftime('%I:%M %p').lstrip('0')}"
+                return f"{row['name'] or 'An untitled assignment'} {timing}"
+            focus = upcoming or rows
+            summary = '; '.join(speakable(row) for row in focus[:3])
+            if len(focus) > 3:
+                summary += f"; and {len(focus) - 3} more"
+            if not upcoming:
+                summary = 'all past due. ' + summary
             return ToolResult(
                 True,
-                f"{len(rows)} Teams assignment(s), {state}. "
-                f"Next: {head['name']} due {due}.",
+                f"You have {len(upcoming)} upcoming Teams assignments. {summary}.",
                 {"assignments": rows},
             )
         except (RuntimeError, aiohttp.ClientError, TimeoutError) as error:

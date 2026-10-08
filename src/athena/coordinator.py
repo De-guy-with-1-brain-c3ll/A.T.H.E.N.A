@@ -135,10 +135,12 @@ class VoiceCoordinator:
         settings_store: RuntimeSettingsStore,
         audio_debug: bool = False,
         local_wake_stt=None,
+        interruption_stt=None,
     ) -> None:
         self.microphone = microphone
         self.speaker = speaker
         self.stt = stt
+        self.interruption_stt = interruption_stt
         # Optional local SenseVoice gate. When present, cloud STT is not opened
         # until this local decoder finds an utterance containing the wake word.
         self.local_wake_stt = local_wake_stt
@@ -226,8 +228,12 @@ class VoiceCoordinator:
     async def _handle_fast_audio_control(self, text):
         command = ToolRegistry.normalize_command(text)
         if not re.search(r"\b(?:switch|move|use|route|hand|go back|back to)\b", command): return False
-        if not re.search(r"\b(?:audio|speaker|microphone|mic|input|output|devices|listening|pi)\b", command): return False
-        target = "computer" if re.search(r"\b(?:computer|pc|laptop|desktop)\b", command) else "pi" if re.search(r"\b(?:pi|board)\b", command) else None
+        audio_named = re.search(r"\b(?:audio|speaker|microphone|mic|input|output|devices|listening|pi)\b", command)
+        returning = re.search(r"\b(?:switch|move|route|hand)\s+(?:it\s+|them\s+)?back\b|\b(?:switch|move|route)\s+(?:it|them)\s+to\b", command)
+        if not audio_named and not returning: return False
+        destinations = re.findall(r"\b(?:to|on|use)\s+(?:(?:the|my|your)\s+)?(computer|pc|laptop|desktop|pi|board)\b", command)
+        named = destinations[-1] if destinations else None
+        target = ("pi" if named in {"pi", "board"} else "computer") if named else "computer" if re.search(r"\b(?:computer|pc|laptop|desktop)\b", command) else "pi" if re.search(r"\b(?:pi|board)\b", command) else None
         if target is None: return False
         try:
             await self._switch_audio(target)
@@ -319,6 +325,7 @@ class VoiceCoordinator:
             self.microphone.open(),
             self.speaker.open(),
             self.stt.connect(),
+            *([self.interruption_stt.connect()] if self.interruption_stt is not None else []),
             self.llm.connect(),
             self.tts.connect(),
             self.memory.connect(),
@@ -832,14 +839,19 @@ class VoiceCoordinator:
 
     @asynccontextmanager
     async def _audio_focus(self):
-        music_tool = self.llm._tools.get("netease_music")
-        player = getattr(music_tool, "player", None)
-        if player is not None:
+        # Every background audio source shares this one speaker, so all of them
+        # have to yield while Athena talks. Ducking only the music player left
+        # YouTube narrating over the reply.
+        players = [getattr(self.llm._tools.get(name), "player", None)
+                   for name in ("netease_music", "youtube_audio")]
+        players = [player for player in players if player is not None]
+        for player in players:
             player.suspend_for_voice()
         try:
-            settle = getattr(player, "wait_for_voice", None)
-            if asyncio.iscoroutinefunction(settle):
-                await settle()
+            for player in players:
+                settle = getattr(player, "wait_for_voice", None)
+                if asyncio.iscoroutinefunction(settle):
+                    await settle()
             yield
         finally:
             try:
@@ -850,7 +862,7 @@ class VoiceCoordinator:
                     if asyncio.iscoroutinefunction(finish):
                         await finish()
             finally:
-                if player is not None:
+                for player in players:
                     player.resume_after_voice()
 
     async def _play_short_sound(self, pcm):
@@ -891,8 +903,10 @@ class VoiceCoordinator:
         return isinstance(state, dict) and bool(state.get("playing")) and not state.get("paused", False)
 
     async def _speak_text(self, text, prompted: bool = False):
-        async with self._audio_focus():
-            await self._speak_text_impl(text, prompted)
+        async def speak():
+            async with self._audio_focus():
+                await self._speak_text_impl(text, prompted)
+        await self._interruptible_speech(speak())
         if prompted and self.wake_word and self._active_until > 0:
             self._active_until = time.monotonic() + 20.0
 
@@ -903,6 +917,10 @@ class VoiceCoordinator:
         announcement used to re-arm it too, so for twenty seconds afterwards any
         conversation in the room was taken as a command and answered.
         """
+        from athena.tts.text import speech_text
+        text = speech_text(text)
+        if not text:
+            return
         turn = uuid4()
         self.active_turn = turn
         self.state = AgentState.SPEAKING
@@ -1409,6 +1427,37 @@ class VoiceCoordinator:
             turn_id, transcript, self.llm.stream_reply(turn_id, transcript, context))
 
     async def _answer_stream(self, turn_id: UUID, transcript: str, fragments) -> None:
+        await self._interruptible_speech(self._answer_stream_impl(turn_id, transcript, fragments))
+
+    async def _interruptible_speech(self, speech):
+        recognizer = getattr(self, 'interruption_stt', None)
+        if recognizer is None:
+            return await speech
+        await self._stop_listening()
+        from athena.interruptions import hear_interruption
+        output = asyncio.create_task(speech)
+        monitor = asyncio.create_task(hear_interruption(self.microphone, recognizer,
+            minimum_rms=max(400, self.settings_store.get('vad_minimum_rms') or 400)))
+        try:
+            done, _ = await asyncio.wait((output, monitor), return_when=asyncio.FIRST_COMPLETED)
+            if monitor in done:
+                try:
+                    interrupted = monitor.result()
+                except Exception as error:
+                    interrupted = ''
+                    print(f'[speech] interruption listener failed ({type(error).__name__})', flush=True)
+                if interrupted:
+                    output.cancel()
+                    await self.cancel_active_turn('user asked to stop speaking')
+                    self._active_until = time.monotonic() + 20
+                    return
+            await output
+        finally:
+            output.cancel()
+            monitor.cancel()
+            await asyncio.gather(output, monitor, return_exceptions=True)
+
+    async def _answer_stream_impl(self, turn_id: UUID, transcript: str, fragments) -> None:
         """Speak model fragments as they arrive from a foreground or queued job."""
         self.state = AgentState.THINKING
         self._reply_timing = {'turn': turn_id, 'started': time.monotonic(), 'first_text': None}
@@ -1422,6 +1471,10 @@ class VoiceCoordinator:
 
         async def emit(clause):
             nonlocal native_voice, used_pcm, playback_task
+            from athena.tts.text import speech_text
+            clause = speech_text(clause)
+            if not clause:
+                return
             if native_voice:
                 async with self._audio_focus():
                     try:
@@ -1601,13 +1654,16 @@ class VoiceCoordinator:
             self._warm_task.cancel()
             await asyncio.gather(self._warm_task, return_exceptions=True)
         self._warm_task = None
-        music = self.llm._tools.get("netease_music")
-        player = getattr(music, "player", None)
-        if player is not None:
-            await player.stop()
+        # Both background players own a child process and the speaker stream, so
+        # either one left running would keep making noise after shutdown.
+        for name in ("netease_music", "youtube_audio"):
+            player = getattr(self.llm._tools.get(name), "player", None)
+            if player is not None:
+                await player.stop()
         await self.cancel_active_turn("shutdown")
         await asyncio.gather(
             self.stt.close(),
+            *([self.interruption_stt.close()] if self.interruption_stt is not None else []),
             *( [self.local_wake_stt.close()] if self.local_wake_stt is not None else []),
             self.tts.close(),
             self.llm.close(),

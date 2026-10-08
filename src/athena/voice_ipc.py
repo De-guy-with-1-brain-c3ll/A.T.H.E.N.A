@@ -4,9 +4,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import hmac
 from pathlib import Path
 
 
+WINDOWS_HOST = os.name == 'nt'
 SOCKET_PATH = Path(os.environ.get("ATHENA_VOICE_SOCKET", "/run/athena/voice-control.sock"))
 
 # Every music command the dashboard may drive: transport, the volume, and the
@@ -25,6 +27,10 @@ class VoiceControlServer:
         self.server: asyncio.AbstractServer | None = None
 
     async def start(self) -> None:
+        if WINDOWS_HOST:
+            if not os.environ.get('ATHENA_LOCAL_CONTROL_TOKEN'): raise RuntimeError('Local control authentication is not configured.')
+            self.server = await asyncio.start_server(self._handle, '127.0.0.1', int(os.environ.get('ATHENA_LOCAL_CONTROL_PORT','8782')))
+            return
         self.path.unlink(missing_ok=True)
         self.server = await asyncio.start_unix_server(self._handle, path=self.path)
         self.path.chmod(0o660)
@@ -36,6 +42,9 @@ class VoiceControlServer:
             if len(raw) > 8192 or not raw.endswith(b"\n"):
                 raise ValueError("Invalid voice-control request.")
             request = json.loads(raw)
+            if not isinstance(request,dict):raise ValueError('Invalid voice-control request.')
+            if WINDOWS_HOST and not hmac.compare_digest(str(request.pop('token','')),os.environ.get('ATHENA_LOCAL_CONTROL_TOKEN','')):
+                raise ValueError('Unauthorized local control request.')
             action = request.get("action")
             if action == "speak":
                 text = str(request.get("text", "")).strip()
@@ -82,7 +91,7 @@ class VoiceControlServer:
         if self.server is not None:
             self.server.close()
             await self.server.wait_closed()
-        self.path.unlink(missing_ok=True)
+        if not WINDOWS_HOST: self.path.unlink(missing_ok=True)
 
 
 async def request_speech(text: str, path: Path = SOCKET_PATH) -> None:
@@ -121,7 +130,11 @@ async def _request(payload: dict, path: Path) -> dict:
     reader = writer = None
     for attempt in range(5):
         try:
-            reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(path), 2)
+            if WINDOWS_HOST:
+                payload = {**payload, 'token': os.environ.get('ATHENA_LOCAL_CONTROL_TOKEN','')}
+                reader, writer = await asyncio.wait_for(asyncio.open_connection('127.0.0.1',int(os.environ.get('ATHENA_LOCAL_CONTROL_PORT','8782'))),2)
+            else:
+                reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(path), 2)
             break
         except (OSError, asyncio.TimeoutError):
             if attempt == 4:
@@ -213,6 +226,10 @@ class VoiceAudioServer:
         self.server: asyncio.AbstractServer | None = None
 
     async def start(self) -> None:
+        if WINDOWS_HOST:
+            if not os.environ.get('ATHENA_LOCAL_CONTROL_TOKEN'): raise RuntimeError('Missing local audio authentication token.')
+            self.server=await asyncio.start_server(self._handle,'127.0.0.1',int(os.environ.get('ATHENA_LOCAL_AUDIO_PORT','8783')))
+            return
         if not _unix_streams_supported():
             raise RuntimeError("Browser audio needs a POSIX host for its local socket.")
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -223,6 +240,15 @@ class VoiceAudioServer:
     async def _handle(self, reader: asyncio.StreamReader,
                       writer: asyncio.StreamWriter) -> None:
         sink = SocketSink(writer)
+        if WINDOWS_HOST:
+            try:
+                kind,payload=await asyncio.wait_for(read_frame(reader),3)
+                request=json.loads(payload)
+                if not isinstance(request,dict):raise ValueError('Invalid audio authentication.')
+                token=request.get('token','')
+                if kind!=CONTROL_FRAME or not hmac.compare_digest(str(token),os.environ.get('ATHENA_LOCAL_CONTROL_TOKEN','')): raise ValueError('Unauthorized audio connection.')
+            except (ValueError,asyncio.TimeoutError,asyncio.IncompleteReadError):
+                writer.close(); await writer.wait_closed(); return
         # A new browser takes over from any previous one.
         self.audio.attach(sink)
         self.audio.drain()
@@ -255,11 +281,18 @@ class VoiceAudioServer:
             self.server.close()
             await self.server.wait_closed()
             self.server = None
-        self.path.unlink(missing_ok=True)
+        if not WINDOWS_HOST: self.path.unlink(missing_ok=True)
 
 
 async def open_audio_stream(path: Path | None = None):
     """Connect the dashboard to the voice process's audio bridge."""
+    if WINDOWS_HOST:
+        try:
+            reader,writer=await asyncio.wait_for(asyncio.open_connection('127.0.0.1',int(os.environ.get('ATHENA_LOCAL_AUDIO_PORT','8783'))),5)
+            writer.write(pack_frame(CONTROL_FRAME,json.dumps({'token':os.environ.get('ATHENA_LOCAL_CONTROL_TOKEN','')}).encode()))
+            await writer.drain()
+            return reader,writer
+        except (OSError,asyncio.TimeoutError): raise RuntimeError(VOICE_OFFLINE) from None
     if not _unix_streams_supported():
         raise RuntimeError(VOICE_OFFLINE)
     target = Path(path) if path is not None else AUDIO_SOCKET_PATH

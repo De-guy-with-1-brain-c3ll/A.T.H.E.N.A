@@ -72,7 +72,14 @@ def bubblewrap_command(executable: str, python: str) -> list[str]:
     simply absent rather than mounted, so there is nothing to escape into.
     """
     command = [executable, "--unshare-all", "--new-session", "--die-with-parent",
-               "--dev", "/dev", "--proc", "/proc"]
+               "--dir", "/dev", "--dir", "/proc"]
+    # systemd's kernel/device protections reject creating device nodes and
+    # mounting proc even in an isolated user namespace. Python only needs
+    # these inert standard devices; expose neither host hardware nor host proc.
+    for device in ("null", "zero", "random", "urandom"):
+        path = "/dev/" + device
+        if os.path.exists(path):
+            command += ["--ro-bind", path, path]
     for path in BWRAP_READ_ONLY:
         if not os.path.exists(path):
             continue
@@ -103,7 +110,11 @@ async def _collect(stream):
 async def run_snapshot(files: dict[str, str], profile: str,
                        entrypoint: str = "main.py", args=None, timeout: int = 20) -> dict:
     bwrap = shutil.which("bwrap") if os.name != "nt" else None
-    python = shutil.which("python3") if bwrap else None
+    # Services put their virtualenv first in PATH. That interpreter lives under
+    # /opt/athena, deliberately absent from the sandbox. Use the system runtime
+    # that is actually mounted rather than exposing the application directory.
+    python = next((path for path in ('/usr/bin/python3', '/bin/python3')
+                   if os.path.isfile(path) and os.access(path, os.X_OK)), None) if bwrap else None
     docker = None if bwrap and python else shutil.which("docker")
     if bwrap and python:
         runtime = "bubblewrap"

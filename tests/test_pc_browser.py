@@ -1,11 +1,13 @@
 import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+import socket
 from uuid import uuid4
 from aiohttp.test_utils import TestClient, TestServer
 from athena.pc_browser import PCBrowser
@@ -13,6 +15,18 @@ from athena.pc_transfer import inbox_app, signature
 
 
 class BrowserControlTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(hasattr(os, 'startfile'), 'os.startfile is Windows-only')
+    async def test_windows_open_falls_back_when_playwright_cannot_start(self):
+        browser = PCBrowser('unused-test-profile')
+        browser.ensure = AsyncMock(side_effect=TimeoutError('driver unavailable'))
+        with patch('athena.pc_browser.os.startfile') as start, patch.object(
+                socket, 'getaddrinfo', return_value=[(socket.AF_INET, socket.SOCK_STREAM,
+                                                      6, '', ('93.184.215.14', 443))]):
+            result = await browser.execute({'action': 'open', 'url': 'https://example.com/'})
+        self.assertTrue(result['opened_external'])
+        self.assertEqual(result['navigation_state'], 'launched_external')
+        start.assert_called_once_with('https://example.com/')
+
     async def test_status_and_disable_do_not_wait_for_navigation(self):
         browser = PCBrowser("unused-test-profile")
         browser.navigation_state = "opening"

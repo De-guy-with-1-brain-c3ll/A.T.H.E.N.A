@@ -31,6 +31,7 @@
     <nav>
       <button class="tab active" data-page="command">Command</button>
       <button class="tab" data-page="history">Conversations</button>
+      <button class="tab" data-page="evidence">Search results</button>
       <button class="tab" data-page="prompts">Prompts</button>
       <button class="tab" data-page="settings">Settings</button>
       <button class="tab" data-page="agents">Agents</button>
@@ -141,8 +142,19 @@
     <section id="history" class="page">
       <article class="card">
         <div class="section-head"><div><p class="eyebrow">SHARED MEMORY</p><h2>Recent conversations</h2></div><button id="refreshHistory" class="secondary">Refresh</button></div>
-        <p class="muted">Voice, terminal, Feishu, and this dashboard appear here after memory saves them.</p>
+        <p class="muted">Saved conversation history across interfaces. Clearing context preserves this history and long-term memories.</p>
+        <button id="clearContext" class="danger" type="button">Clear conversation context</button>
+        <p id="contextMessage" class="muted" role="status"></p>
         <div id="conversationList" class="conversation-list"></div>
+        <button id="olderHistory" class="secondary" type="button">Load older conversations</button>
+      </article>
+    </section>
+
+    <section id="evidence" class="page">
+      <article class="card">
+        <div class="section-head"><h2>Actual search and page results</h2><button id="refreshEvidence" class="secondary" type="button">Refresh</button></div>
+        <p class="muted">Latest 30 web tool outputs across interfaces, captured from this update onward. These are source data, not verified conclusions. No extra AI calls.</p>
+        <div id="evidenceList"></div>
       </article>
     </section>
 

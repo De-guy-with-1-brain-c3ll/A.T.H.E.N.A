@@ -86,18 +86,41 @@ class Speaker:
 
     async def open(self) -> None:
         self._audio = pyaudio.PyAudio()
-        index = self._device_index()
-        info = (self._audio.get_device_info_by_index(index) if index is not None
-                else self._audio.get_default_output_device_info())
+        try:
+            index = self._device_index()
+            info = (self._audio.get_device_info_by_index(index) if index is not None
+                    else self._audio.get_default_output_device_info())
+            self._stream = self._audio.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=self._sample_rate,
+                output=True,
+                output_device_index=index,
+            )
+        except (OSError, RuntimeError) as error:
+            # "could not bind"/"no default device" from PortAudio says nothing
+            # about which of the board's outputs is wrong, and on a headless Pi
+            # this is the difference between "no speaker" and "wrong HDMI
+            # profile". Say which device was wanted and what was found.
+            available = []
+            try:
+                for candidate in range(self._audio.get_device_count()):
+                    details = self._audio.get_device_info_by_index(candidate)
+                    if int(details.get("maxOutputChannels", 0)) > 0:
+                        available.append(f"[{candidate}] {details['name']}")
+            except Exception:
+                pass
+            if self._audio is not None:
+                self._audio.terminate()
+                self._audio = None
+            detail = ("available outputs: " + ", ".join(available)) if available \
+                else "this computer reports no audio output devices at all"
+            raise RuntimeError(
+                f"Could not open the ATHENA audio output ({error}). {detail}. "
+                f"Set ATHENA_AUDIO_OUTPUT_DEVICE to one of those names if the "
+                f"default is wrong.") from None
         print(f"Audio output: [{int(info['index'])}] {info['name']} at {self._sample_rate} Hz",
               flush=True)
-        self._stream = self._audio.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=self._sample_rate,
-            output=True,
-            output_device_index=index,
-        )
 
     @property
     def music_format(self) -> tuple[int, int]:
@@ -117,20 +140,27 @@ class Speaker:
         # A remote speaker can switch format per packet and uses those
         # arguments; this stream cannot, and is already opened at the format
         # that `music_format` reports.
-        if self._stream is not None:
-            pcm = self._apply_volume(pcm)
-            # PortAudio streams are not safe for concurrent writes. TTS and
-            # background music share this stream, so serialize every write.
-            packet_bytes = max(2, self._sample_rate // 10 * 2)
-            for offset in range(0, len(pcm), packet_bytes):
-                async with self._write_lock:
-                    write = asyncio.create_task(asyncio.to_thread(
-                        self._stream.write, pcm[offset:offset + packet_bytes]))
-                    try:
-                        await asyncio.shield(write)
-                    except asyncio.CancelledError:
-                        await asyncio.gather(write, return_exceptions=True)
-                        raise
+        if self._stream is None:
+            # Silently discarding the audio here is how a board with no working
+            # sound card reported every track as playing while the room stayed
+            # quiet. `open` failing is the real cause and it has to surface.
+            raise RuntimeError(
+                "The Pi's audio output is not open, so there is nothing to play "
+                "through. Check that a sound card is present and that "
+                "ATHENA_AUDIO_OUTPUT_DEVICE names it.")
+        pcm = self._apply_volume(pcm)
+        # PortAudio streams are not safe for concurrent writes. TTS and
+        # background music share this stream, so serialize every write.
+        packet_bytes = max(2, self._sample_rate // 10 * 2)
+        for offset in range(0, len(pcm), packet_bytes):
+            async with self._write_lock:
+                write = asyncio.create_task(asyncio.to_thread(
+                    self._stream.write, pcm[offset:offset + packet_bytes]))
+                try:
+                    await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    await asyncio.gather(write, return_exceptions=True)
+                    raise
 
     async def stop(self) -> None:
         if self._stream is not None:

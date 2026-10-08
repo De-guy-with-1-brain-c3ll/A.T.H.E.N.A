@@ -190,8 +190,8 @@ class FeishuGateway:
         self.recipients[job.id] = incoming.open_id
         if self.background.approval_model is None:
             self.approval_owner = None
-        await self._send(incoming.open_id,
-            f"Task accepted [{str(job.id)[:8]}]. You can keep messaging me.")
+        # Submission and timer ticks carry no new result. Deliver the actual
+        # reply and tool completion/failure notifications instead.
 
     async def deliver_ready(self):
         while True:

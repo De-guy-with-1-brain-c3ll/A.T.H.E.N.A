@@ -53,6 +53,7 @@ class ParseWhenTests(unittest.TestCase):
 
     def test_spoken_numbers_are_understood(self):
         for text, minutes in (("10 minutes", 10), ("ten minutes", 10),
+                              ("thirty minutes", 30), ("thirty-five minutes", 35),
                               ("in ten minutes", 10), ("twenty five minutes", 25),
                               ("twenty-five minutes", 25), ("half an hour", 30),
                               ("an hour", 60), ("a minute", 1),
@@ -215,7 +216,7 @@ class AlarmHonestyTests(unittest.IsolatedAsyncioTestCase):
         try:
             answer = "".join([part async for part in model.stream_reply(uuid4(), "yes, do it again")])
             self.assertNotIn("is set again", answer)
-            self.assertIn("don't have that alarm saved", answer)
+            self.assertIn("verified completion receipt", answer)
             self.assertEqual(alerts.rows(), [])
         finally:
             await model.close()
@@ -247,8 +248,9 @@ class AlarmHonestyTests(unittest.IsolatedAsyncioTestCase):
         alerts.add("1 hour", "lecture")
         registry = ToolRegistry.discover(services={"settings": None, "alert_scheduler": alerts})
         model = self._model(registry)
+        listed = NS(index=0, id='alarms', function=NS(name='list_alarms', arguments='{}'))
         model._client.chat.completions.create = AsyncMock(
-            side_effect=[Stream([chunk("Your lecture alarm is set.")])])
+            side_effect=[Stream([chunk(calls=[listed])]), Stream([chunk("Your lecture alarm is set.")])])
         try:
             answer = "".join([part async for part in model.stream_reply(uuid4(), "is the alarm set?")])
             self.assertIn("is set", answer)
@@ -273,11 +275,11 @@ class AlarmHonestyTests(unittest.IsolatedAsyncioTestCase):
         alerts = AlertScheduler(lambda _text: True, path=self.root / "alerts.json")
         registry = ToolRegistry.discover(services={"settings": None, "alert_scheduler": alerts})
         model = self._model(registry)
-        model._client.chat.completions.create = AsyncMock()
+        model._client.chat.completions.create = AsyncMock(return_value=Stream([chunk('What time should I set it for?')]))
         try:
             answer = "".join([part async for part in model.stream_reply(uuid4(), "set an alarm")])
-            self.assertIn("Use a time like", answer)
-            model._client.chat.completions.create.assert_not_awaited()
+            self.assertIn("What time", answer)
+            model._client.chat.completions.create.assert_awaited_once()
             self.assertEqual(alerts.rows(), [])
         finally:
             await model.close()
@@ -460,6 +462,10 @@ class TrailingLabelTests(unittest.TestCase):
     def test_a_plain_request_still_gets_the_default_message(self):
         self.assertEqual(self.registry.alarm_request("set an alarm for 10 minutes"),
                          ("10 minutes", "Your alarm is due."))
+        self.assertEqual(self.registry.alarm_request("set a timer for thirty"),
+                         ("thirty minutes", "Your alarm is due."))
+        self.assertEqual(self.registry.alarm_request("start a timer for twenty five"),
+                         ("twenty five minutes", "Your alarm is due."))
 
     def test_an_explicit_to_phrase_is_untouched(self):
         self.assertEqual(

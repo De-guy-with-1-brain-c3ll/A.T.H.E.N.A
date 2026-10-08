@@ -182,13 +182,12 @@ class FunAsrRecognizer:
 
     async def start_turn(self, turn_id: UUID) -> None:
         self._turn_id = turn_id
-        # finish_turn starts a pre-warm asynchronously.  A new utterance can
-        # arrive while that socket is opening; cancel and join it before opening
-        # a foreground socket, otherwise the late pre-warm overwrites
-        # ``self._recognition`` and sends this turn to the wrong session.
+        # finish_turn starts a pre-warm asynchronously. If speech arrives while
+        # it is opening, finish that handshake and reuse it. Cancelling it here
+        # waited for its SDK thread and then started a second handshake: the
+        # user had already been detected but waited several more seconds.
         prewarm_task = self._prewarm_task
         if prewarm_task is not None:
-            prewarm_task.cancel()
             await asyncio.gather(prewarm_task, return_exceptions=True)
             if self._prewarm_task is prewarm_task:
                 self._prewarm_task = None

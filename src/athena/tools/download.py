@@ -90,6 +90,8 @@ class DownloadTool:
                 Path(str(temporary) + ":Zone.Identifier").write_text("[ZoneTransfer]\nZoneId=3\n", encoding="utf-8")
             self.target(arguments)  # Recheck links/existing file after network I/O.
             os.link(temporary, target)  # Atomic publication with no overwrite.
+            from athena.artifacts import remember_artifact
+            remember_artifact(target, self.root.parent)
             return ToolResult(True, f"Downloaded {target.name}. I have not opened or run it.",
                               {**data, "path": str(target), "executed": False, "untrusted_content": True})
         except DownloadRedirect as error:

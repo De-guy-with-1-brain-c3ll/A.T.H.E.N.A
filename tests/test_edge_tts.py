@@ -6,7 +6,9 @@ including the one setting whose *absence* is the point.
 """
 import asyncio
 import os
+from pathlib import Path
 import shutil
+import tempfile
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -31,6 +33,7 @@ from athena.tts.edge import (
     edge_sample_rate,
     edge_voice,
 )
+from athena.settings.store import RuntimeSettingsStore
 
 
 class _Settings:
@@ -49,11 +52,19 @@ class SettingsTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ATHENA_EDGE_VOICE", None)
             self.assertEqual(edge_voice(), DEFAULT_VOICE)
-            self.assertEqual(DEFAULT_VOICE, "en-US-JennyNeural")
+        self.assertEqual(DEFAULT_VOICE, "en-US-AvaNeural")
 
     def test_a_configured_voice_wins(self):
         with patch.dict(os.environ, {"ATHENA_EDGE_VOICE": "en-GB-RyanNeural"}):
             self.assertEqual(edge_voice(), "en-GB-RyanNeural")
+
+    def test_saved_edge_voice_can_override_the_service_voice(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+                os.environ, {"ATHENA_EDGE_VOICE": "en-US-AriaNeural"}):
+            settings = RuntimeSettingsStore(Path(directory) / 'settings.json')
+            self.assertEqual(EdgeSynthesizer(settings=settings)._voice, 'en-US-AriaNeural')
+            settings.set('edge_voice', 'en-US-AvaNeural')
+            self.assertEqual(EdgeSynthesizer(settings=settings)._voice, 'en-US-AvaNeural')
 
     def test_rate_and_pitch_are_unset_by_default(self):
         # Not cosmetic: sending a no-op pitch measured 1.2-2.0s to first audio
@@ -79,7 +90,7 @@ class SettingsTests(unittest.TestCase):
 
     def test_the_decoder_asks_for_mono_pcm_at_the_speaker_rate(self):
         command = decoder_command(22_050)
-        self.assertEqual(command[0], "ffmpeg")
+        self.assertIn("ffmpeg", Path(command[0]).name.casefold())
         self.assertIn("-ar", command)
         self.assertEqual(command[command.index("-ar") + 1], "22050")
         self.assertEqual(command[command.index("-ac") + 1], "1")
@@ -92,7 +103,8 @@ class SettingsTests(unittest.TestCase):
 class AvailabilityTests(unittest.TestCase):
     def test_a_missing_ffmpeg_is_reported_as_itself(self):
         # The two dependencies have different fixes, so they are reported apart.
-        with patch("athena.tts.edge.shutil.which", return_value=None):
+        with patch("athena.tts.edge.shutil.which", return_value=None), \
+             patch.dict("sys.modules", {"imageio_ffmpeg": None}):
             available, reason = edge_available()
         self.assertFalse(available)
         self.assertIn("ffmpeg", reason)

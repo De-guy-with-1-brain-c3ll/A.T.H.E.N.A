@@ -197,7 +197,8 @@ class Settings:
             stt_prewarm=os.environ.get("ATHENA_STT_PREWARM", "1").strip().casefold()
             in {"1", "true", "yes", "on"},
             stt_max_sentence_silence_ms=(
-                int(os.environ.get("ATHENA_STT_MAX_SENTENCE_SILENCE_MS", "0")) or None
+                int(os.environ.get("ATHENA_STT_MAX_SENTENCE_SILENCE_MS",
+                    str(runtime.get("vad_end_silence_ms") if runtime else 750))) or None
             ),
             stt_semantic_punctuation=os.environ.get(
                 "ATHENA_STT_SEMANTIC_PUNCTUATION", "0").strip().casefold()

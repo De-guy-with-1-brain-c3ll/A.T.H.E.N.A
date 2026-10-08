@@ -16,6 +16,7 @@ dependencies = [
   "openai>=1.0",
   "msal>=1.31,<2",
   "PyAudio>=0.2.14",
+  "websocket-client>=1.8,<2",
   "PyYAML>=6,<7",
   # Optional local speech, used when ATHENA_STT_BACKEND=sensevoice or
   # ATHENA_TTS_BACKEND=sherpa. It is a small wheel with a self-contained ONNX
@@ -26,7 +27,14 @@ dependencies = [
   # account or key — it speaks the Edge browser's own protocol. Also needs
   # ffmpeg on PATH, because Edge only returns MP3 and the speaker wants PCM.
   "edge-tts>=7,<8",
+  # YouTube audio-only playback. Pure Python with no compiled parts, so it
+  # installs cheaply on the Pi; it shells out to ffmpeg, which is already a
+  # requirement for the Edge voice.
+  "yt-dlp>=2024.10.0",
+  "imageio-ffmpeg>=0.6,<1; platform_system == 'Windows'",
   "tzdata>=2024.1; platform_system == 'Windows'",
+  "psutil>=6,<8",
+  "cryptography>=42",
 ]
 
 [tool.setuptools.packages.find]

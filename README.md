@@ -4,6 +4,14 @@ A.T.H.E.N.A. is an open-source, JARVIS-inspired personal voice agent built in Py
 It runs continuously on a small Linux computer such as an Orange Pi while using cloud
 models for conversation, speech recognition, and speech generation.
 
+## Install without development tools
+
+Download the Windows Standalone, Windows Companion, or Linux SBC installer from
+[GitHub Releases](https://github.com/De-guy-with-1-brain-c3ll/A.T.H.E.N.A/releases/latest).
+Follow the [installation and pairing guide](docs/installation.md). Windows packages
+include Python and FFmpeg. Linux setup installs its dependencies and guides you
+through credentials and pairing. Setup does not activate the microphone or play sound.
+
 ## Current features
 
 - Wake-word voice interaction with a short follow-up listening window

@@ -1,4 +1,4 @@
-"""User-approved artifact transfer to a configured PC inbox."""
+"""Routine artifact transfer confined to a configured, authenticated PC inbox."""
 import asyncio
 import hashlib
 import ipaddress
@@ -15,6 +15,7 @@ import aiohttp
 
 from athena.paths import data_directory
 from athena.pc_transfer import MAX_BYTES, signature
+from athena.pc_discovery import resolve_pc_url
 from athena.tools.coding import check_link
 from athena.tools.models import PermissionLevel, ToolDefinition, ToolResult
 
@@ -65,12 +66,12 @@ class UploadTool:
             self.status = "File transfer reporting failed; check the PC inbox."
             return ToolResult(False, self.status)
     definition = ToolDefinition(name="upload_to_pc",
-        description="Send a generated artifact or downloaded file to the user's configured PC inbox. Requires fresh user approval. Only files under ATHENA data/coding, data/downloads or data/reports; never credentials. Maximum 25 MiB. Destination cannot be supplied by the model.",
+        description="Send a requested artifact to the configured PC inbox in the background without extra approval. Only coding/download/report files; never credentials. Maximum 25 MiB. Check status for completion.",
         parameters={"type": "object", "properties": {
             "path": {"type": "string", "minLength": 1, "maxLength": 500,
-                     "description": "Verified file path. Omit to send the last file actually written in this interface."}},
+                     "description": "Verified saved file path. Omit to send ATHENA's most recently saved coding, download or report artifact across interfaces."}},
             "additionalProperties": False},
-        permission=PermissionLevel.CONFIRM, timeout_seconds=90)
+        permission=PermissionLevel.SAFE, timeout_seconds=90)
 
     def inspect(self, arguments):
         key = os.environ.get("ATHENA_PC_TRANSFER_KEY", "")
@@ -81,7 +82,9 @@ class UploadTool:
         if not ipaddress.ip_address(parsed.hostname).is_private:
             raise ValueError("The destination must be a private LAN IP address.")
         root = data_directory().absolute()
-        requested = arguments.get("path") or getattr(self.coding, "last_artifact", None)
+        from athena.artifacts import saved_artifacts
+        saved = saved_artifacts(root)
+        requested = arguments.get("path") or (saved[0]['path'] if saved else None) or getattr(self.coding, "last_artifact", None)
         if not requested:
             raise ValueError("No saved file selected. Create a file first or specify its verified path.")
         candidate = Path(requested)
@@ -100,7 +103,8 @@ class UploadTool:
         return path, payload, url, key
 
     async def prepare(self, arguments):
-        path, payload, url, _ = await asyncio.to_thread(self.inspect, arguments)
+        path, payload, url, key = await asyncio.to_thread(self.inspect, arguments)
+        url = await resolve_pc_url(url, key)
         digest = hashlib.sha256(payload).hexdigest()
         return {"path": str(path), "sha256": digest, "destination": url}, f"Send {path.name} ({len(payload)} bytes) to your PC at {urlsplit(url).hostname}? Say yes or no."
 
@@ -108,8 +112,11 @@ class UploadTool:
         try:
             path, payload, url, key = await asyncio.to_thread(self.inspect, arguments)
             digest = hashlib.sha256(payload).hexdigest()
-            if digest != arguments.get("sha256") or url != arguments.get("destination"):
-                return ToolResult(False, "The file or destination changed. Request fresh approval.")
+            if digest != arguments.get("sha256"):
+                return ToolResult(False, "The file or destination changed. Request the transfer again.")
+            url = await resolve_pc_url(url, key)
+            if url != arguments.get("destination"):
+                return ToolResult(False, "The PC address changed. Request the transfer again.")
             stamp, nonce = str(int(time.time())), uuid4().hex
             name = re.sub(r"[^A-Za-z0-9_.-]", "_", path.name)[:115]
             name = "artifact-" + name if not name[:1].isalnum() else name
@@ -119,6 +126,12 @@ class UploadTool:
                        "X-Athena-Signature": signature(key, stamp, nonce, name, digest)}
             from athena.metrics import progress
             started = time.monotonic()
+            def report(state, done, **extra):
+                progress('transfer', {'state': state, 'filename': path.name,
+                    'operation_id': arguments.get('_operation_id'),
+                    'bytes_done': done, 'bytes_total': len(payload),
+                    'percent_complete': round(100 * done / len(payload), 1) if payload else 100.0,
+                    'transferred_size': f'{done} bytes', **extra})
             headers['Content-Length'] = str(len(payload))
             async def chunks():
                 last_update = 0
@@ -130,12 +143,10 @@ class UploadTool:
                     if now - last_update < .25 and done != len(payload):
                         continue
                     last_update = now
-                    progress('transfer', {'state': 'sending', 'filename': path.name,
-                        'bytes_done': done, 'bytes_total': len(payload),
-                        'bytes_per_second': done / max(.001, time.monotonic() - started),
-                        'message': 'Bytes submitted to network; awaiting verified PC receipt.'})
-            progress('transfer', {'state': 'sending', 'filename': path.name,
-                'bytes_done': 0, 'bytes_total': len(payload)})
+                    report('sending', done,
+                        bytes_per_second=done / max(.001, time.monotonic() - started),
+                        message='Bytes submitted to network; awaiting verified PC receipt.')
+            report('sending', 0)
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=80), trust_env=False) as session:
                 async with session.post(url, data=chunks(), headers=headers, allow_redirects=False) as response:
                     if response.status != 200:
@@ -143,10 +154,9 @@ class UploadTool:
                     receipt = await response.json()
                     if receipt.get("sha256") != digest or receipt.get("bytes") != len(payload):
                         return ToolResult(False, "The PC did not confirm the complete file.")
-            progress('transfer', {'state': 'complete', 'filename': path.name,
-                'bytes_done': len(payload), 'bytes_total': len(payload),
-                'message': 'PC verified the complete file.', 'receipt': receipt})
-            return ToolResult(True, f"Sent {path.name} to your PC's ATHENA inbox.", receipt)
+            report('complete', len(payload), message='PC verified the complete file.', receipt=receipt)
+            return ToolResult(True, f"Sent {path.name} to your PC's ATHENA inbox. {len(payload)} bytes transferred, 100% complete.",
+                              {**receipt, 'percent_complete': 100.0, 'transferred_size': f'{len(payload)} bytes'})
         except (ValueError, OSError, aiohttp.ClientError, TimeoutError):
             from athena.metrics import progress
             progress('transfer', {'state': 'failed', 'message': 'No verified complete receipt.'})
@@ -160,9 +170,20 @@ class TransferStatus:
         self.upload = upload
         self.store = None
     async def execute(self, arguments):
+        from athena.metrics import read_progress
+        sample = read_progress('transfer')
+        receipt = self.store.result('upload_to_pc') if self.store is not None else None
+        operation = receipt.data.get('operation', {}) if receipt is not None else {}
+        current = self.store is None or sample.get('operation_id') == operation.get('id')
+        if sample and current and sample.get('state') == 'sending':
+            done = int(sample.get('bytes_done') or 0)
+            total = int(sample.get('bytes_total') or 0)
+            percent = sample.get('percent_complete', round(100 * done / total, 1) if total else 0)
+            return ToolResult(True, f"File transfer is {percent}% complete. {done} of {total} bytes submitted; waiting for the PC receipt.", sample)
         if self.store is not None:
-            return self.store.result('upload_to_pc')
-        return ToolResult(True, self.upload.status)
+            return ToolResult(receipt.success, receipt.spoken_text,
+                              {**receipt.data, **(sample if current else {})})
+        return ToolResult(True, self.upload.status, sample)
 
 
 def create_tools():

@@ -52,6 +52,18 @@ class WeatherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.data['latitude'], 22.54)
         self.assertIn('Shenzhen, Guangdong, China', result.data['location'])
 
+    async def test_english_spelling_matches_accented_city_name(self):
+        http = AsyncMock()
+        http.json.side_effect = [{"results": [
+            {"name": "Ürümqi", "admin1": "Xinjiang", "country": "China",
+             "latitude": 43.8, "longitude": 87.6, "population": 3_000_000},
+            {"name": "Urumqi Pap Heliport", "admin1": "Xinjiang", "country": "China",
+             "latitude": 43.81, "longitude": 87.68},
+        ]}, FORECAST]
+        result = await WeatherTool(http).execute({"location": "Urumqi, China"})
+        self.assertTrue(result.success, result.spoken_text)
+        self.assertEqual(result.data['latitude'], 43.8)
+
     async def test_invalid_coordinates_and_failure(self):
         tool = WeatherTool(AsyncMock(json=AsyncMock(side_effect=TimeoutError)))
         self.assertFalse((await tool.execute({"location": "100,200"})).success)

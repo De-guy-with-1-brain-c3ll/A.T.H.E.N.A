@@ -95,6 +95,20 @@ class ToolRegistry:
         # just because a question contains "it".
         if tool == 'download_file' and self._last_download:
             return self.download_status()
+        if tool == 'upload_to_pc':
+            transfer = self.get('pc_transfer_status')
+            if transfer is not None:
+                from athena.metrics import read_progress
+                sample = read_progress('transfer')
+                receipt = self.status_store.result('upload_to_pc')
+                operation = receipt.data.get('operation', {})
+                if (sample.get('state') == 'sending' and
+                        sample.get('operation_id') == operation.get('id')):
+                    done, total = int(sample.get('bytes_done', 0)), int(sample.get('bytes_total', 0))
+                    percent = sample.get('percent_complete', 0)
+                    return ToolResult(True, f'Transfer is {percent}% complete. {done} of {total} bytes submitted; waiting for the PC receipt.',
+                                      {**receipt.data, **sample})
+                return receipt
         if tool == 'run_command' and self._last_command:
             return self.command_status()
         if tool == 'agent_task' and getattr(self.get(tool), 'manager', None):
@@ -390,6 +404,13 @@ class ToolRegistry:
             message = (match.group(2) or "").strip()
             if not when:
                 continue
+            # "Set a timer for thirty" is a normal spoken shorthand for
+            # thirty minutes. Keep alarms and reminders explicit because a
+            # bare number there might mean a clock time.
+            if re.search(r"\btimer\b", spoken):
+                from athena.alerts import parse_amount
+                if parse_amount(when) is not None:
+                    when += " minutes"
             # The lazy group stops at the keyword, so "set a ten minute rest
             # timer" leaves "ten minute rest" as the time. Give the trailing
             # words back to the message until the time parses, so a label like
@@ -449,6 +470,23 @@ class ToolRegistry:
             watch_match = re.search(r"\bcancel\s+(?:watch|alert|notification)\s+([a-f0-9]{4,20})\b", command)
             if watch_match:
                 return await self.execute("cancel_watch", {"watch_id": watch_match.group(1)})
+        youtube = self._tools.get("youtube_audio")
+        if youtube is not None:
+            # A pasted link is unambiguous, so it never needs the model to
+            # decide which provider was meant.
+            if re.search(r"(?:https?://|www\.|youtu\.be/|youtube\.com)", command):
+                return await self.execute("youtube_audio", {"action": "play", "query": command})
+            if re.search(r"\b(?:on|from)\s+youtube\b", command):
+                query = re.sub(r"^.*?\b(?:on|from)\s+youtube\s+", "", command).strip()
+                query = re.sub(r"^(?:the\s+)?(?:video|clip|talk|lecture|episode)\s+(?:called\s+|titled\s+|named\s+)?", "", query).strip()
+                if query:
+                    return await self.execute("youtube_audio", {"action": "play", "query": query})
+            if re.search(r"\b(?:pause|resume|continue|stop|skip|next|status)\b", command) and re.search(
+                    r"\b(?:youtube|video|clip)\b", command):
+                action = ("pause" if "pause" in command else "resume" if re.search(r"\b(?:resume|continue)\b", command)
+                          else "next" if re.search(r"\b(?:skip|next)\b", command)
+                          else "status" if "status" in command else "stop")
+                return await self.execute("youtube_audio", {"action": action})
         music = self._tools.get("netease_music")
         if music is not None:
             if re.search(r"\b(?:choose|pick|auto(?:matically)?|surprise me with)\b.*\b(?:playlist|music)\b", command):
@@ -617,9 +655,23 @@ class ToolRegistry:
         self.clear_approval()
         return None
 
+    async def handle_permission_reply(self, text: str) -> ToolResult | None:
+        """Security gate only, never a keyword-based normal tool dispatcher.
+
+        The model cannot mint a user's consent. Only a fresh user reply to the
+        exact pending hub grant may consume it. A plain yes without a grant
+        continues through the language model like any other conversational turn.
+        """
+        self._shutdown_authorized = self.is_shutdown_command(text)
+        if self._pending is not None and self.normalize_command(text) in self.APPROVE | self.DENY:
+            return await self.handle_user_command(text)
+        return None
+
     async def _finish_upload(self, tool, arguments, operation):
+        self.status_store.finish(operation, 'running', 'Sending file; awaiting verified PC receipt.')
         try:
-            result = await self._tracked_call('upload_to_pc', tool.execute(arguments), operation)
+            result = await self._tracked_call('upload_to_pc',
+                                              tool.execute({**arguments, '_operation_id': operation}), operation)
         except asyncio.CancelledError:
             tool.status = 'File transfer interrupted; check the PC inbox before retrying.'
             raise
@@ -769,8 +821,33 @@ class ToolRegistry:
         tool = self._tools.get(name)
         timeout = tool.definition.timeout_seconds if tool else 10
         operation = self._begin_operation(name, arguments, timeout, confirmed)
+        if name == 'upload_to_pc' and tool is not None and not confirmed:
+            # Prepare/pin the confined artifact before dispatch. Mark submitted
+            # before spawning, so a fast verified receipt cannot be overwritten
+            # by the initial "started" response.
+            try:
+                self._validate_arguments(tool.definition.parameters, arguments)
+                prepared, _message = await asyncio.wait_for(tool.prepare(arguments), timeout=10)
+            except (ValueError, OSError, TimeoutError) as error:
+                message = str(error) or 'Transfer preparation timed out; nothing was sent.'
+                self.status_store.finish(operation, 'failed', message)
+                return ToolResult(False, message, {'operation_id': operation})
+            message = 'Sending the file to your PC in the background. I will report completion or failure.'
+            tool.status = message
+            self.status_store.finish(operation, 'submitted', message)
+            task = asyncio.create_task(self._finish_upload(tool, prepared, operation))
+            self._command_tasks.add(task)
+            task.add_done_callback(self._command_tasks.discard)
+            return ToolResult(True, message, {'operation_id': operation, 'background_started': True,
+                                            'transfer_started': True})
         result = await self._tracked_call(name, self._execute(name, arguments, confirmed=confirmed),
                                           operation, timeout=False)
+        if name in {'search_web', 'read_webpage', 'browse_webpage'}:
+            try:
+                from athena.web_evidence import record
+                await asyncio.to_thread(record, name, arguments, result, operation)
+            except Exception:
+                pass  # Diagnostic storage must not break a successful lookup.
         if result.data.get('pending_approval') or result.data.get('approval_required'):
             self._pending_operation = operation
         return ToolResult(result.success, result.spoken_text, {**result.data, 'operation_id': operation})

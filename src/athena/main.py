@@ -19,6 +19,7 @@ from athena.settings.store import RuntimeSettingsStore
 from athena.tts import build_synthesizer, synthesizer_sample_rate
 from athena.voice_ipc import VoiceAudioServer, VoiceControlServer
 from athena.tools.netease import NetEasePlayer
+from athena.tools.youtube import YouTubePlayer
 
 
 def browser_audio_enabled() -> bool:
@@ -40,12 +41,15 @@ async def run() -> None:
         target="computer" if browser_audio_enabled() else "pi")
     microphone, speaker = router.microphone, router.speaker
     netease_player = NetEasePlayer(speaker)
-    tools, alerts = build_registry(settings_store, netease_player=netease_player)
+    youtube_player = YouTubePlayer(speaker)
+    tools, alerts = build_registry(settings_store, netease_player=netease_player,
+                                   youtube_player=youtube_player)
     local_wake_stt = build_local_wake_recognizer(settings)
     coordinator = VoiceCoordinator(
         microphone=microphone,
         speaker=speaker,
         stt=build_recognizer(settings),
+        interruption_stt=build_recognizer(settings),
         llm=DeepSeekLanguageModel(
             settings.voice_llm_api_key,
             settings.voice_llm_model,
@@ -72,6 +76,9 @@ async def run() -> None:
     )
     alerts.notify = coordinator.enqueue_external_speech
     coordinator.audio_router = router
+    route_tool = tools.get("manage_audio_devices")
+    if route_tool is not None:
+        route_tool.coordinator = coordinator
     coordinator.alerts = alerts
     # The sleep tools would otherwise run a consolidation inline, inside a spoken
     # turn, and time out on work that was going to succeed. With the coordinator
@@ -85,7 +92,7 @@ async def run() -> None:
         alerts.ensure_watch("cj_schedule", {"at": os.environ.get("ATHENA_CJ_SCHEDULE_AT", "16:00")},
                             "the Communication Journal schedule", 86_400)
     control = VoiceControlServer(coordinator)
-    audio_bridge = VoiceAudioServer(audio) if os.name == "posix" else None
+    audio_bridge = VoiceAudioServer(audio)
     try:
         await coordinator.connect()
         await alerts.start()

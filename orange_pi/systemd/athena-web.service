@@ -24,7 +24,7 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-RestrictSUIDSGID=true
+RestrictSUIDSGID=false
 LockPersonality=true
 ReadWritePaths=/opt/athena/data
 

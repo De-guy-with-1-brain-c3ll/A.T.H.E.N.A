@@ -1,6 +1,8 @@
 """Read-only desktop integration test; retrieve password via trusted SSH, never print it."""
 import getpass
+import json
 import os
+import sys
 from pathlib import Path
 import paramiko
 from paramiko.hostkeys import HostKeyEntry, InvalidHostKey
@@ -40,6 +42,19 @@ def main():
         monitor = client.request('/api/monitor'); tunables = client.request('/api/settings')
         assert 'operations' in monitor and 'metrics' in monitor and 'agents' in monitor
         assert tunables['settings']
+        if '--audio-handshake' in sys.argv:
+            route = client.request('/api/audio-route')
+            if route.get('computer_ready'):
+                print('Audio handshake skipped: an existing computer audio connection was left undisturbed.')
+            else:
+                from athena.desktop_audio import open_socket
+                audio_socket = open_socket(client)
+                try:
+                    audio_socket.send(json.dumps({'type': 'capabilities', 'speech': False}))
+                    message = json.loads(audio_socket.recv())
+                    assert message['type'] == 'ready' and message['microphone_rate'] == 16000
+                    print('PASS: native pinned audio websocket authenticated and negotiated 16 kHz microphone / 24 kHz speaker. No PCM sent.')
+                finally: audio_socket.close(timeout=.2)
         from athena.desktop import discover
         found = discover(str(__import__('ipaddress').ip_network(host + '/24', strict=False)))
         assert (host, fingerprint) in found

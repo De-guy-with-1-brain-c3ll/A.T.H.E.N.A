@@ -118,7 +118,7 @@ class TransferTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.post("/upload", data=b"hello", headers=headers)).status, 403)
         self.assertEqual((await self.client.post("/upload", data=b"changed", headers=self.headers())).status, 400)
         self.assertFalse(list((Path(self.temp.name)/"inbox").glob("*.partial")))
-    async def test_real_approval_and_transfer(self):
+    async def test_requested_transfer_starts_without_extra_approval(self):
         root = Path(self.temp.name)/"data"; (root/"reports").mkdir(parents=True)
         file = root/"reports"/"report.txt"; file.write_text("hello")
         registry = ToolRegistry(); tool = UploadTool(); registry.register(tool)
@@ -127,10 +127,12 @@ class TransferTests(unittest.IsolatedAsyncioTestCase):
             result = await registry.execute("upload_to_pc", {"path": str(file)})
             self.assertTrue(result.success)
             self.assertFalse(list((Path(self.temp.name)/"inbox").glob("*.txt")))
-            self.assertTrue(registry.has_pending_approval)
-            await registry.handle_user_command("yes")
+            self.assertFalse(registry.has_pending_approval)
+            self.assertTrue(result.data['background_started'])
             await registry.wait_for_commands()
             self.assertIn("Sent", tool.status)
+            status = registry.status_store.result(operation_id=result.data['operation_id'])
+            self.assertEqual(status.data['status'], 'completed')
     async def test_changed_file_requires_new_approval(self):
         root = Path(self.temp.name)/"data"; (root/"reports").mkdir(parents=True)
         file = root/"reports"/"report.txt"; file.write_text("hello")

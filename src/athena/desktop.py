@@ -5,6 +5,7 @@ import hmac
 import http.client
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -74,7 +75,8 @@ class Client:
         self.cookie = ''; self.csrf = ''
 
     def request(self, path, body=None):
-        connection = PinnedConnection(self.host, self.fingerprint)
+        connection = PinnedConnection(self.host, self.fingerprint,
+            timeout=90 if path == '/api/context/clear' else 20 if path in {'/api/service', '/api/audio-route'} else 6)
         try:
             headers = {'Accept': 'application/json'}
             if self.cookie: headers['Cookie'] = self.cookie
@@ -135,6 +137,8 @@ class App:
         self.root = root; self.client = None; self.polling = False; self.closed = False
         self.generation = 0; self.events = queue.Queue(); self.pool = ThreadPoolExecutor(max_workers=4)
         self.chat_jobs = {}; self.settings = {}; self.setting_vars = {}
+        self.native_audio = None; self.audio_polling = False
+        self.transcript_stamp = 0.; self.device_ids = {'Windows default microphone': None}
         root.title('ATHENA • Control'); root.geometry('1150x790'); root.minsize(850, 620)
         root.configure(bg='#07151d')
         style = ttk.Style(root); style.theme_use('clam')
@@ -166,14 +170,16 @@ class App:
         ttk.Button(connect, text='Find Pi', command=self.scan).pack(side='left')
         book = ttk.Notebook(outer); book.pack(fill='both', expand=True, pady=14)
         self.tabs = {}
-        for name in ('Overview', 'Tasks', 'Subagents', 'Settings', 'Prompts', 'Chat', 'Usage & delay'):
+        for name in ('Overview', 'Microphone', 'Tasks', 'Subagents', 'Settings', 'Prompts', 'Chat', 'History', 'Search results', 'Usage & delay'):
             pane = ttk.Frame(book, padding=12); book.add(pane, text=name); self.tabs[name] = pane
-        self.overview(); self.tasks = self.table(self.tabs['Tasks'], ('Tool / file', 'State', 'Progress', 'Details'))
+        self.overview(); self.microphone_ui(); self.tasks = self.table(self.tabs['Tasks'], ('Tool / file', 'State', 'Progress', 'Details'))
         self.agents = self.table(self.tabs['Subagents'], ('ID', 'State', 'Progress', 'Report'))
         self.settings_ui(); self.prompts_ui(); self.chat_ui()
+        self.history_ui(); self.evidence_ui()
         self.metrics = self.text(self.tabs['Usage & delay'])
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self.root.after(80, self.drain); self.root.after(1500, self.poll)
+        self.root.after(50, self.audio_tick); self.root.after(300, self.audio_poll)
 
     def text(self, pane, height=None):
         widget = tk.Text(pane, bg='#0a1c26', fg='#d8f1f6', insertbackground='white',
@@ -197,9 +203,9 @@ class App:
         self.voice_status = tk.StringVar(value='Voice: not connected')
         ttk.Label(pane, textvariable=self.voice_status, font=('Segoe UI', 16)).pack(anchor='w', pady=12)
         for label, target in (('Use Pi audio', 'pi'), ('Use computer audio', 'computer')):
-            ttk.Button(pane, text=label, command=lambda t=target: self.api('/api/audio-route', {'target': t})).pack(anchor='w', pady=4)
-        ttk.Label(pane, text='Computer microphone streaming still uses the browser audio page; keep that page open.').pack(anchor='w', pady=6)
-        ttk.Button(pane, text='Open browser audio page', command=self.open_browser).pack(anchor='w')
+            ttk.Button(pane, text=label, command=lambda t=target: self.choose_audio(t)).pack(anchor='w', pady=4)
+        ttk.Label(pane, text='Native PC microphone and speaker controls are in the Microphone tab. No browser needed.').pack(anchor='w', pady=6)
+        ttk.Button(pane, text='Open web dashboard (optional)', command=self.open_browser).pack(anchor='w')
         ttk.Button(pane, text='PC keyboard control…', command=self.keyboard).pack(anchor='w', pady=6)
         music = ttk.Frame(pane); music.pack(fill='x', pady=12)
         for label, action in (('Pause music', 'pause'), ('Resume', 'resume'), ('Next track', 'next'), ('Stop music', 'stop')):
@@ -210,6 +216,139 @@ class App:
         ttk.Spinbox(volume, from_=0, to=100, textvariable=self.volume, width=6).pack(side='left', padx=8)
         ttk.Button(volume, text='Apply volume', command=self.set_volume).pack(side='left')
         self.summary = self.text(pane)
+
+    def microphone_ui(self):
+        pane = self.tabs['Microphone']
+        self.mic_status = tk.StringVar(value='Microphone off. Click Start to allow this app to capture your microphone.')
+        ttk.Label(pane, textvariable=self.mic_status, wraplength=1000).pack(anchor='w', pady=(0, 12))
+        row = ttk.Frame(pane); row.pack(fill='x', pady=5)
+        self.mic_device = tk.StringVar(value='Windows default microphone')
+        self.device_combo = ttk.Combobox(row, textvariable=self.mic_device,
+            values=list(self.device_ids), state='readonly', width=55)
+        self.device_combo.pack(side='left', padx=(0, 8))
+        ttk.Button(row, text='Refresh devices', command=self.refresh_devices).pack(side='left')
+        buttons = ttk.Frame(pane); buttons.pack(fill='x', pady=10)
+        ttk.Button(buttons, text='Start PC microphone + speaker', command=self.start_microphone).pack(side='left', padx=4)
+        ttk.Button(buttons, text='Stop PC microphone', command=self.stop_microphone).pack(side='left', padx=4)
+        ttk.Button(buttons, text='Use Pi devices', command=lambda: self.choose_audio('pi')).pack(side='left', padx=4)
+        ttk.Label(pane, text='PC microphone level • local, 20 updates/second, no cloud token usage').pack(anchor='w', pady=(12, 4))
+        self.pc_meter = tk.Canvas(pane, height=25, bg='#09202b', highlightthickness=0)
+        self.pc_meter.pack(fill='x'); self.pc_bar = self.pc_meter.create_rectangle(0, 0, 0, 25, fill='#4de2ec', outline='')
+        self.pc_level = tk.StringVar(value='Not capturing')
+        ttk.Label(pane, textvariable=self.pc_level).pack(anchor='w', pady=3)
+        ttk.Label(pane, text='ATHENA received input • reflects the current Pi/PC audio route').pack(anchor='w', pady=(12, 4))
+        self.pi_meter = tk.Canvas(pane, height=25, bg='#09202b', highlightthickness=0)
+        self.pi_meter.pack(fill='x'); self.pi_bar = self.pi_meter.create_rectangle(0, 0, 0, 25, fill='#4de2ec', outline='')
+        self.pi_level = tk.StringVar(value='Waiting for Pi telemetry')
+        ttk.Label(pane, textvariable=self.pi_level).pack(anchor='w', pady=3)
+        ttk.Label(pane, text='Live transcript', font=('Segoe UI', 14, 'bold')).pack(anchor='w', pady=(14, 4))
+        self.live_transcript = tk.StringVar(value='Waiting for speech…')
+        ttk.Label(pane, textvariable=self.live_transcript, wraplength=950).pack(anchor='w', pady=6)
+        self.transcript_log = self.text(pane, height=6)
+        ttk.Label(pane, text='Recognition stays wake-word gated on the Pi. No recording files are saved by this app.\n'
+            'When ATHENA speaks here, microphone forwarding pauses to avoid hearing its own answer.').pack(anchor='w', pady=7)
+
+    @staticmethod
+    def meter(canvas, rectangle, rms, peak=0):
+        db = 20 * math.log10(max(1, rms) / 32768)
+        value = min(1., max(0., (db + 60) / 60))
+        canvas.coords(rectangle, 0, 0, value * max(1, canvas.winfo_width()), 25)
+        canvas.itemconfigure(rectangle, fill='#ff6d7a' if peak >= 32000 else '#4de2ec')
+        return db
+
+    def audio_tick(self):
+        if self.closed: return
+        native = self.native_audio
+        if native:
+            for _ in range(15):
+                try: kind, message = native.events.get_nowait()
+                except queue.Empty: break
+                self.mic_status.set(message)
+                if kind == 'stopped': self.device_combo.configure(state='readonly')
+            rms, peak, stamp = native.level
+            if time.monotonic() - stamp > .5: rms = peak = 0
+            db = self.meter(self.pc_meter, self.pc_bar, rms, peak)
+            self.pc_level.set(f'RMS {rms:.0f} • {db:.1f} dBFS' if not native.stop_event.is_set() else 'Microphone off')
+        self.root.after(50, self.audio_tick)
+
+    def audio_poll(self):
+        if self.closed: return
+        if self.client and not self.audio_polling:
+            self.audio_polling = True; client = self.client
+            def failed(error):
+                self.audio_polling = False; self.pi_level.set('Pi audio telemetry unavailable')
+            self.background(lambda: client.request('/api/audio'), self.show_audio, failed)
+        self.root.after(300, self.audio_poll)
+
+    def show_audio(self, audio):
+        self.audio_polling = False
+        age = audio.get('age')
+        stale = bool(audio.get('stale')) or age is None or age > 2
+        rms = float(audio.get('rms', 0) or 0) if not stale else 0
+        self.meter(self.pi_meter, self.pi_bar, rms)
+        self.pi_level.set('Waiting for recent microphone frames (ATHENA may be speaking)' if stale else
+            f'RMS {rms:.0f} • {audio.get("state", "waiting")} • threshold {audio.get("threshold", 0)}')
+        partial = str(audio.get('heard', ''))
+        final = str(audio.get('transcript', ''))
+        partial_at = float(audio.get('heard_at', 0) or 0)
+        final_at = float(audio.get('transcript_at', 0) or 0)
+        text = partial if partial and partial_at >= final_at else final
+        self.live_transcript.set(('Live: ' if partial and partial_at >= final_at else 'Recognized: ') + text if text else 'Waiting for speech…')
+        if final and final_at > self.transcript_stamp:
+            self.transcript_stamp = final_at
+            self.transcript_log.insert('end', time.strftime('%H:%M:%S', time.localtime(final_at)) + '  ' + final + '\n')
+            if int(self.transcript_log.index('end-1c').split('.')[0]) > 100:
+                self.transcript_log.delete('1.0', '2.0')
+            self.transcript_log.see('end')
+
+    def refresh_devices(self):
+        if self.native_audio and self.native_audio.thread and self.native_audio.thread.is_alive():
+            self.mic_status.set('Stop the PC microphone before changing devices.'); return
+        from athena.desktop_audio import devices
+        def found(items):
+            self.device_ids = {'Windows default microphone': None}
+            self.device_ids.update({f'{index}: {label}': index for index, label in items})
+            self.device_combo.configure(values=list(self.device_ids))
+            self.mic_device.set('Windows default microphone')
+        self.background(devices, found, lambda e: self.mic_status.set('Cannot list microphones: ' + e))
+
+    def start_microphone(self):
+        if not self.client: self.mic_status.set('Connect to the Pi first.'); return
+        if self.native_audio and self.native_audio.thread and self.native_audio.thread.is_alive():
+            if self.native_audio.stop_event.is_set():
+                self.mic_status.set('Microphone is stopping; try Start again in a moment.')
+            else:
+                self.api('/api/audio-route', {'target': 'computer'},
+                    lambda r: self.mic_status.set('PC microphone + speaker active.'))
+            return
+        from athena.desktop_audio import NativeAudio
+        native = NativeAudio(self.client, self.device_ids.get(self.mic_device.get()))
+        self.native_audio = native; self.device_combo.configure(state='disabled')
+        self.mic_status.set('Opening the selected Windows microphone…'); native.start()
+        def ready():
+            if self.closed or self.native_audio is not native: return
+            if native.stop_event.is_set(): return
+            if native.ready.is_set():
+                client = self.client
+                def activated(result):
+                    if self.native_audio is native and not native.stop_event.is_set():
+                        self.mic_status.set('Native PC microphone + speaker connected. Say ATHENA to activate.')
+                def failed(error):
+                    native.fail('Could not select PC audio: ' + error)
+                    native.close(); self.mic_status.set(native.failure)
+                self.background(lambda: client.request('/api/audio-route', {'target': 'computer'}), activated, failed)
+            else: self.root.after(100, ready)
+        self.root.after(100, ready)
+
+    def stop_microphone(self):
+        if self.native_audio: self.native_audio.close()
+        self.mic_status.set('PC microphone stopped. Use Pi devices to move listening back to the Pi.')
+
+    def choose_audio(self, target):
+        if target == 'computer': self.start_microphone(); return
+        # Keep the opted-in computer bridge armed in standby, so a voice
+        # command on the Pi can switch back without reopening Windows devices.
+        self.api('/api/audio-route', {'target': target})
 
     def settings_ui(self):
         pane = self.tabs['Settings']
@@ -235,6 +374,69 @@ class App:
         entry.pack(side='left', fill='x', expand=True); entry.bind('<Return>', lambda e: self.send_chat())
         ttk.Button(row, text='Send', command=self.send_chat).pack(side='left', padx=5)
         ttk.Button(row, text='Recent conversations', command=lambda: self.api('/api/conversations', callback=self.show_conversations)).pack(side='left')
+        ttk.Button(row, text='Clear conversation context', command=self.clear_context).pack(side='left', padx=5)
+
+    def history_ui(self):
+        pane = self.tabs['History']
+        row = ttk.Frame(pane); row.pack(fill='x', pady=5)
+        ttk.Button(row, text='Refresh history', command=self.load_history).pack(side='left')
+        self.older_history = ttk.Button(row, text='Load older', command=lambda: self.load_history(True))
+        self.older_history.pack(side='left', padx=6)
+        ttk.Button(row, text='Clear conversation context', command=self.clear_context).pack(side='left')
+        ttk.Label(pane, text='Saved history across interfaces. Clearing context keeps history and long-term memories.').pack(anchor='w')
+        self.history_offset = 0
+        self.history_log = self.text(pane)
+
+    def load_history(self, older=False):
+        offset = self.history_offset if older else 0
+        def show(result):
+            rows = result.get('conversations', [])
+            if not older: self.history_log.delete('1.0', 'end')
+            for row in rows:
+                self.history_log.insert('end', f'[{row.get("at", "")}]\nYou: {row.get("user", "")}\nATHENA: {row.get("assistant", "")}\n\n')
+            if not rows and not older: self.history_log.insert('end', 'No saved conversations yet.')
+            self.history_offset = offset + len(rows)
+            self.older_history.configure(state='normal' if len(rows) == 40 else 'disabled')
+        self.api('/api/conversations?offset=' + str(offset), callback=show)
+
+    def evidence_ui(self):
+        pane = self.tabs['Search results']
+        ttk.Label(pane, text='Actual web tool output, not ATHENA’s summary. New searches only; no extra AI calls.').pack(anchor='w')
+        ttk.Button(pane, text='Refresh search results', command=self.load_evidence).pack(anchor='w', pady=8)
+        self.evidence_picker = ttk.Combobox(pane, state='readonly')
+        self.evidence_picker.pack(fill='x', pady=5)
+        self.evidence_picker.bind('<<ComboboxSelected>>', lambda _: self.show_evidence())
+        self.evidence_rows = []
+        self.evidence_log = self.text(pane)
+
+    def load_evidence(self):
+        def show(result):
+            self.evidence_rows = result.get('results', [])
+            labels = [f'{row.get("at", "")} | {row.get("tool", "")} | {row.get("request", {}).get("query") or row.get("request", {}).get("url", "")}'
+                      for row in self.evidence_rows]
+            self.evidence_picker.configure(values=labels)
+            if labels:
+                self.evidence_picker.current(0); self.show_evidence()
+            else:
+                self.evidence_picker.set('No results yet')
+                self.replace(self.evidence_log, 'Ask ATHENA to search, then refresh. Older raw results were not saved.')
+        self.api('/api/web-evidence', callback=show)
+
+    def show_evidence(self):
+        index = self.evidence_picker.current()
+        if 0 <= index < len(self.evidence_rows):
+            self.replace(self.evidence_log, json.dumps(self.evidence_rows[index], ensure_ascii=False, indent=2))
+
+    def clear_context(self):
+        if not messagebox.askyesno('Clear conversation context',
+                'Start a fresh conversation? Saved history and long-term memories will remain.'):
+            return
+        def cleared(result):
+            self.chat_jobs.clear()
+            self.chat_log.delete('1.0', 'end')
+            self.status.set(result.get('message', 'Context cleared.'))
+            self.load_history()
+        self.api('/api/context/clear', {}, cleared)
 
     def background(self, work, success=None, fail=None):
         generation = self.generation
@@ -264,7 +466,8 @@ class App:
 
     def connect(self):
         host, password = self.host.get().strip(), self.password.get()
-        self.generation += 1; self.client = None; self.polling = False
+        self.stop_microphone()
+        self.generation += 1; self.client = None; self.polling = False; self.audio_polling = False
         self.status.set('Checking the Pi certificate…')
         def verified(result):
             address, fingerprint = result
@@ -447,6 +650,7 @@ class App:
         self.chat_log.see('end')
 
     def close(self):
+        if self.native_audio: self.native_audio.close()
         self.closed = True; self.generation += 1
         self.client = None; self.password.set('')
         self.pool.shutdown(wait=False, cancel_futures=True); self.root.destroy()
@@ -458,6 +662,12 @@ def main():
     if '--self-test' in sys.argv: root.withdraw()
     app = App(root)
     if '--self-test' in sys.argv:
+        from athena.desktop_audio import FrameConverter, levels
+        import pyaudio
+        import websocket
+        assert levels(bytes(640)) == (0, 0)
+        assert FrameConverter(16000).convert(bytes(640)) == [bytes(640)]
+        assert pyaudio.paInt16 and websocket.WebSocket
         app.render_settings({'settings': {
             'voice_test': {'value': True, 'value_type': 'bool', 'description': 'Test boolean', 'applies_live': True},
             'delay_test': {'value': 200, 'value_type': 'int', 'description': 'Test number', 'applies_live': False}}})
@@ -465,6 +675,9 @@ def main():
             'agents': [{'id': 'child', 'parent': 'parent', 'state': 'running', 'progress': 'Reading sources'}],
             'download': {'state': 'downloading', 'bytes_done': 12, 'bytes_total': 100, 'updated': time.time()},
             'metrics': {'totals': {'qwen_stt': {'audio_seconds': 2.5}}, 'latest': {}}}, 12, {'serviceLabel': 'Test'}))
+        app.show_audio({'age': .1, 'rms': 1800, 'threshold': 400, 'state': 'speech',
+            'heard': 'Athena hello', 'heard_at': 20, 'transcript': 'earlier words', 'transcript_at': 10})
+        assert app.live_transcript.get() == 'Live: Athena hello'
         root.update(); app.close(); return 0
     root.mainloop(); return 0
 

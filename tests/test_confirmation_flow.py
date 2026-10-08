@@ -54,7 +54,8 @@ class ConfirmationFlowTests(unittest.IsolatedAsyncioTestCase):
                     "ATHENA_PC_UPLOAD_URL": "http://192.168.33.187:8781/upload",
                     "ATHENA_PC_TRANSFER_KEY": "test"*16}):
                 tool = UploadTool(); tool.coding = SimpleNamespace(last_artifact=str(file))
-                prepared, spoken = await tool.prepare({})
+                with patch('athena.tools.pc_transfer.resolve_pc_url', AsyncMock(return_value='http://192.168.33.187:8781/upload')):
+                    prepared, spoken = await tool.prepare({})
                 self.assertEqual(prepared["path"], str(file))
                 self.assertIn("Say yes", spoken)
 

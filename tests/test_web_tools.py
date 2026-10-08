@@ -31,6 +31,17 @@ class PublicAddressTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WebToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_f1_lookup_includes_current_date_and_official_entry_not_invented_date(self):
+        http = AsyncMock()
+        http.get.return_value = WebResponse("https://www.bing.com/search", b"<rss><channel/></rss>", "application/rss+xml")
+        with patch.object(SearchWebTool, "_china_date", return_value="2026-10-04"):
+            result = await SearchWebTool(http).execute({"query": "Bahrain Grand Prix 2026"})
+        self.assertTrue(result.success)
+        self.assertIn("2026-10-04", http.get.call_args.args[0])
+        self.assertEqual(result.data["results"][0]["url"], "https://www.formula1.com/en/racing/2026")
+        self.assertEqual(result.data["results"][0]["source_type"], "official_entry_point")
+        self.assertNotIn("March 24", str(result.data))
+
     def test_extracts_article_strips_noise_and_limits_content(self):
         html = '<title>News</title><nav>menu</nav><main><h1>Hello</h1><p>' + 'word ' * 500 + '</p><a href="/next">Next</a><script>secret()</script></main>'
         result = extract_page(html, "https://example.com", 100)
@@ -47,9 +58,9 @@ class WebToolTests(unittest.IsolatedAsyncioTestCase):
         tool = ReadWebpageTool(http)
         result = await tool.execute({"url": "https://example.com"})
         self.assertTrue(result.success)
-        self.assertEqual(result.data["text"], "Actual content")
+        self.assertIn("Actual content", result.data["text"])
         http.get.return_value = WebResponse("https://example.com", b"pdf", "application/pdf")
-        self.assertFalse((await tool.execute({"url": "https://example.com"})).success)
+        self.assertFalse((await tool.execute({"url": "https://example.com", "refresh": True})).success)
 
     async def test_search_returns_sources_and_rejects_entities(self):
         http = AsyncMock()

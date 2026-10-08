@@ -58,7 +58,7 @@ class LLMToolTests(unittest.IsolatedAsyncioTestCase):
             try:
                 answer = ''.join([part async for part in model.stream_reply(
                     uuid4(), 'please check the current time for me')])
-                self.assertIn('right time', answer)
+                self.assertRegex(answer, r'It is \d{1,2}:\d{2} [AP]M')
                 sent = model._client.chat.completions.create.await_args_list[1].kwargs['messages']
                 tool_messages = [item for item in sent if item.get('role') == 'tool']
                 self.assertEqual(len(tool_messages), 1)
@@ -355,4 +355,6 @@ class LLMToolTests(unittest.IsolatedAsyncioTestCase):
             results = [json.loads(m['content']) for m in requests[-1]['messages'] if m['role'] == 'tool']
             self.assertEqual(len(results), 3)
             self.assertTrue(all(r['success'] for r in results))
-            self.assertGreaterEqual(requests[0]['max_tokens'], 4096)
+            # Initial discovery is cheap; large output is offered only once
+            # the model has selected the coding tool.
+            self.assertGreaterEqual(requests[1]['max_tokens'], 4096)

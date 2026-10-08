@@ -1,6 +1,7 @@
 """Live weather with Open-Meteo's non-commercial API and ten-minute cache."""
 from datetime import datetime, timezone
 import time
+import unicodedata
 from urllib.parse import urlencode
 import aiohttp
 from athena.tools._http import PublicHTTP, PublicWebError
@@ -8,6 +9,12 @@ from athena.tools.models import ToolDefinition, ToolResult
 
 
 class WeatherTool:
+    @staticmethod
+    def _name_key(value):
+        # Open-Meteo uses accented native spellings such as "Ürümqi" while
+        # English speech recognition normally returns "Urumqi".
+        return ''.join(c for c in unicodedata.normalize('NFKD', str(value).casefold())
+                       if not unicodedata.combining(c))
     definition = ToolDefinition(
         name="get_weather",
         description="Get live conditions, hourly forecasts and up to seven days of weather. Location is city with country, or 'latitude,longitude'. Ask which location if ambiguous; airport codes are not supported.",
@@ -53,9 +60,9 @@ class WeatherTool:
                 if len(matches) > 1:
                     query_parts = [part.strip().casefold() for part in location.split(",") if part.strip()]
                     exact = [item for item in matches
-                             if str(item.get("name", "")).casefold() == query_parts[0]
-                             and all(any(part == str(item.get(field, "")).casefold()
-                                             or part in str(item.get(field, "")).casefold()
+                             if self._name_key(item.get("name", "")) == self._name_key(query_parts[0])
+                             and all(any(self._name_key(part) == self._name_key(item.get(field, ""))
+                                             or self._name_key(part) in self._name_key(item.get(field, ""))
                                              for field in ("country", "admin1", "admin2"))
                                      for part in query_parts[1:])]
                     ranked = sorted(exact, key=lambda item: item.get("population") or 0, reverse=True)
