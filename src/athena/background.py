@@ -66,6 +66,8 @@ class BackgroundAgents:
         from athena.tools.models import ToolResult
         if not is_status_question(text):
             return None
+        if self.model._tools.openclaw_status_arguments(text, context) is not None:
+            return None  # Read the PC worker asynchronously through OpenClaw's status tool.
         wanted = topic_tool(text)
         if not wanted:
             for message in reversed(context or []):
@@ -149,8 +151,13 @@ class BackgroundAgents:
             raise
         except Exception as error:
             # Provider failures already contain deliberately safe, actionable text.
-            job.reply = (str(error) if error.__class__.__name__ == "DeepSeekUnavailable"
-                         else "That request failed. Please try again.")
+            failure = (str(error) if error.__class__.__name__ == "DeepSeekUnavailable"
+                       else "I couldn't finish that request. No task completion was confirmed.")
+            # Playback may already be draining the fragment queue. Updating
+            # job.reply alone makes failures after a preamble completely silent.
+            fragment = ('\n' if parts else '') + failure
+            await job.reply_fragments.put(fragment)
+            job.reply = ''.join(parts) + fragment
         finally:
             timer.cancel()
             # The consumer must be ended even when a provider fails or is

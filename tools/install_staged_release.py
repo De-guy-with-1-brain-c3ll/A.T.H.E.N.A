@@ -22,4 +22,18 @@ with updater.update_lock(root):
         raise RuntimeError('Refusing an older release sequence')
     updater.install_release(root, manifest, bundle, 'athena-voice.service')
     updater.restart_service('athena-feishu.service')
+import subprocess
+# Check the active release with its real PC configuration, not the updater's
+# stripped environment. Silent tool discovery must not masquerade as a working
+# OpenClaw install. Values stay in process memory and are never printed.
+probe = (
+    "from athena.config import load_local_environment; load_local_environment(); "
+    "from athena.tools.registry import ToolRegistry; import os; "
+    "names=set(ToolRegistry.discover().names()); "
+    "assert not os.environ.get('ATHENA_PC_UPLOAD_URL') or "
+    "{'openclaw_task','openclaw_status'} <= names, 'OpenClaw tools missing from active release'; "
+    "print('Active release tool check passed.')"
+)
+subprocess.run(['/opt/athena/current/.venv/bin/python', '-c', probe],
+               cwd='/opt/athena/current', check=True, timeout=30)
 print('Installed and restarted ATHENA ' + manifest['version'], flush=True)

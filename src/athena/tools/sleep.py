@@ -41,7 +41,7 @@ class SleepModeTool:
         name="sleep_mode",
         description=(
             "Consolidate a day of short-term conversation into long-term memory using the "
-            "stronger DeepSeek model. Use when Benjamin says to go to sleep, to sleep on it, "
+            "stronger DeepSeek model. Use when the user says to go to sleep, to sleep on it, "
             "or asks ATHENA to remember today properly. It returns immediately and keeps "
             "working in the background; use sleep_status to report how it went."
         ),

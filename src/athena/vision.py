@@ -18,8 +18,11 @@ from athena.paths import data_directory
 
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 # The flash tier is plenty for reading handwriting and printed notes, and it is
-# an order of magnitude cheaper than the plus tier.
-DEFAULT_VISION_MODEL = "qwen3-vl-flash"
+# an order of magnitude cheaper than the plus tier. It is not, however, served
+# on every DashScope account: the endpoint answers 404 "Model not exist" rather
+# than degrading, so the default has to be a model the account actually has.
+# Override with ATHENA_VISION_MODEL when the flash tier becomes available.
+DEFAULT_VISION_MODEL = "qwen3-vl-plus"
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 # Asking for the content rather than a description: the point is to make the
 # post readable, not to admire the picture.
@@ -77,9 +80,10 @@ def sharepoint_target(url: str) -> tuple[str, str, str] | None:
 class ImageReader:
     """Turn an image into text with Qwen-VL."""
 
-    def __init__(self, api_key: str, model: str = DEFAULT_VISION_MODEL) -> None:
+    def __init__(self, api_key: str, model: str = DEFAULT_VISION_MODEL, *,
+                 base_url: str = DASHSCOPE_BASE_URL, timeout: float = 30, max_retries: int = 2) -> None:
         self.model = model
-        self._client = AsyncOpenAI(api_key=api_key, base_url=DASHSCOPE_BASE_URL)
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries)
         self.last_error: str | None = None
 
     async def read(self, data: bytes, mime: str, prompt: str = NOTES_PROMPT) -> str:

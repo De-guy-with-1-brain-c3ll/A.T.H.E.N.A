@@ -55,6 +55,8 @@ class ToolRegistry:
     def contextual_status(self, text, context=None):
         if not is_status_question(text):
             return None
+        if self.openclaw_status_arguments(text, context) is not None:
+            return None  # Live PC state is read asynchronously by the model entry point.
         tool = topic_tool(text)
         explicit_topic = tool is not None
         for name in self.names():
@@ -119,6 +121,35 @@ class ToolRegistry:
                                   f"Agent {row['id']} ({row['objective'][:100]}): {row['state']}. " +
                                   (row['report'][:1000] or row['progress']), {'agent': row})
         return self.status_store.result(tool)
+
+    def openclaw_status_arguments(self, text, context=None):
+        if not self.get('openclaw_status') or not is_status_question(text):
+            return None
+        wanted = topic_tool(text)
+        if wanted is None:
+            for message in reversed(context or []):
+                if message.get('role') == 'user' and not is_status_question(message.get('content', '')):
+                    wanted = topic_tool(message.get('content', ''))
+                    if wanted:
+                        break
+        receipts = self.status_store.rows('openclaw_task')
+        conversation_task = any(message.get('role') == 'assistant' and re.search(
+            r'OpenClaw task [a-f0-9]{12}', message.get('content', ''), re.I) for message in context or [])
+        if wanted != 'openclaw_task' and not (wanted in {None, 'coding_workspace'} and (receipts or conversation_task)):
+            return None
+        if receipts and receipts[0]['state'] in {'waiting_approval', 'approval_expired'}:
+            return None  # No PC task exists before approval.
+        arguments = {'action': 'report' if re.search(r'\b(?:report|done|finished|complete|completed)\b', text, re.I) else 'status'}
+        ident = re.search(r'\b[a-f0-9]{12}\b', text)
+        if ident:
+            arguments['id'] = ident.group()
+        else:
+            for message in reversed(context or []):
+                if message.get('role') == 'assistant' and (ident := re.search(
+                        r'OpenClaw task ([a-f0-9]{12})', message.get('content', ''), re.I)):
+                    arguments['id'] = ident.group(1).lower()
+                    break
+        return arguments
 
     def background_summary(self):
         parts = []
@@ -587,6 +618,8 @@ class ToolRegistry:
             if time.monotonic() >= expires:
                 return ToolResult(False, "That approval expired. Ask for the action again.")
             started = time.monotonic()
+            if name == 'openclaw_task':
+                return await self.execute(name, arguments, confirmed=True)
             if name == "upload_to_pc":
                 tool = self._tools[name]
                 tool.status = "Sending the approved file to your PC."
@@ -642,6 +675,10 @@ class ToolRegistry:
             if name == "run_command":
                 self._last_command["status"] = "cancelled"
                 return ToolResult(True, "Command cancelled.")
+            if name == 'openclaw_task':
+                if self._pending_operation:
+                    self.status_store.finish(self._pending_operation, 'cancelled', 'OpenClaw task did not start.')
+                return ToolResult(True, 'OpenClaw task cancelled before starting.')
             self._last_download["status"] = "cancelled"
             return ToolResult(True, "Download cancelled.")
         if self._last_download and re.search(r"\b(url|link)\b", command) and re.search(r"\b(show|give|what|which)\b", command):
@@ -649,7 +686,7 @@ class ToolRegistry:
             if url:
                 return ToolResult(True, "I've printed the inspected URL in the terminal.", {"display_url": url})
         if self._pending and command in {"okay", "ok"}:
-            action = "file transfer" if self._pending[0] == "upload_to_pc" else "command" if self._pending[0] == "run_command" else "download"
+            action = "OpenClaw task" if self._pending[0] == 'openclaw_task' else "file transfer" if self._pending[0] == "upload_to_pc" else "command" if self._pending[0] == "run_command" else "download"
             return ToolResult(False, f"Say yes to approve this {action}, or no to cancel.")
         # A different request invalidates old permission; it cannot authorize a later job.
         self.clear_approval()
@@ -860,7 +897,7 @@ class ToolRegistry:
                      result.data.get('approval_required') else 'completed' if result.success else 'failed')
             if name == 'background_workflow' and result.success and result.data.get('task_id'):
                 state = 'submitted'
-            if name == 'agent_task' and result.success and result.data.get('background_started'):
+            if name in {'agent_task', 'openclaw_task'} and result.success and result.data.get('background_started'):
                 state = 'submitted'
             self.status_store.finish(operation, state, result.spoken_text)
             return result
@@ -887,6 +924,12 @@ class ToolRegistry:
         if name == "shutdown_athena" and not self._shutdown_authorized:
             return ToolResult(False, "Say shut down ATHENA to stop the assistant.")
         if definition.permission is not PermissionLevel.SAFE and not confirmed:
+            if name == "openclaw_task":
+                self._pending = (name, copy.deepcopy(arguments), time.monotonic() + 120)
+                return ToolResult(True,
+                    "OpenClaw can modify files and run commands for this task: "
+                    + arguments['objective'] + ". Shall I start it?",
+                    {"pending_approval": True, "approval_required": True})
             if name == "run_command" and getattr(tool, "can_run_unattended", lambda _args: False)(arguments):
                 return await self.execute(name, arguments, confirmed=True)
             if name == "upload_to_pc":

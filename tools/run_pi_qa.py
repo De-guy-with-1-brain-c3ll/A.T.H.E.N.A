@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--interactions", action="store_true", help="Evaluate 27 model cases; bounded paid requests")
     parser.add_argument("--ids", help="Comma-separated interaction case IDs to retest")
     parser.add_argument("--deploy", action="store_true", help="Install the signed published release")
+    parser.add_argument('--pc-agent-config', action='store_true', help='Synchronise the signed PC bridge settings during deployment')
     parser.add_argument("--pc-inbox", action="store_true", help="Send a harmless synthetic Pi-to-PC receipt test")
     parser.add_argument("--workflow", action="store_true", help="Validate actual background tool wiring without model calls")
     parser.add_argument("--race-lookup", action="store_true", help="One silent live race correction lookup, capped at four model requests")
@@ -29,6 +30,8 @@ def main():
     parser.add_argument("--vision", action="store_true", help="Include one bounded paid Qwen vision call with --pc-browser")
     parser.add_argument("--command", help="Run an explicit diagnostic command instead of the QA suite")
     args = parser.parse_args()
+    if args.pc_agent_config and not args.deploy:
+        parser.error('--pc-agent-config requires --deploy')
     client = paramiko.SSHClient()
     from paramiko.hostkeys import HostKeyEntry, InvalidHostKey
     for line in (Path.home()/".ssh/known_hosts").read_text().splitlines():
@@ -48,6 +51,23 @@ def main():
         if args.deploy:
             stage = f"/tmp/athena-install-{int(time.time())}"
             sftp = client.open_sftp()
+            if args.pc_agent_config:
+                from athena.pc_transfer import lan_address
+                key = (ROOT/'orange_pi/.pc-transfer-key').read_text().strip()
+                if len(key) < 32:
+                    raise RuntimeError('The PC bridge key is missing; nothing was deployed.')
+                url = f'http://{lan_address()}:8781/upload'
+                for target in ('/etc/athena/athena.env', '/etc/athena/web.env'):
+                    with sftp.open(target) as source:
+                        content = source.read().decode()
+                    lines = [line for line in content.splitlines() if not line.startswith(
+                        ('ATHENA_PC_UPLOAD_URL=', 'ATHENA_PC_TRANSFER_KEY='))]
+                    lines.extend([f'ATHENA_PC_UPLOAD_URL={url}', f'ATHENA_PC_TRANSFER_KEY={key}'])
+                    with sftp.open(target + '.pc-agent.tmp', 'w') as output:
+                        output.write('\n'.join(lines) + '\n')
+                    sftp.chmod(target + '.pc-agent.tmp', 0o600)
+                    sftp.posix_rename(target + '.pc-agent.tmp', target)
+                print('Voice and dashboard PC bridge settings synchronised; credentials were not displayed.', flush=True)
             sftp.mkdir(stage)
             import json
             feed = ROOT/'orange_pi/update_feed'

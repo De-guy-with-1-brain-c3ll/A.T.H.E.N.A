@@ -640,7 +640,7 @@ class SleepCycle:
     def _messages(self, chunk: list, summary: str, existing_facts: list,
                   day: date, *, part: tuple[int, int]) -> list[dict]:
         conversation = "\n\n".join(
-            f"TURN {turn.turn_id}\nBENJAMIN: {turn.user_text}\nATHENA: {turn.assistant_text}"
+            f"TURN {turn.turn_id}\nUSER: {turn.user_text}\nATHENA: {turn.assistant_text}"
             for turn in chunk
         )
         heading = "A FULL DAY OF CONVERSATION" if part[1] == 1 else "MORE OF THE SAME DAY"

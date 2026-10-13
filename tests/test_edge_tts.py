@@ -145,6 +145,9 @@ class _FakeFfmpeg:
     async def wait(self):
         return 0
 
+    async def communicate(self):
+        return await self.stdout.read(), await self.stderr.read()
+
     def kill(self):
         self.returncode = -9
 

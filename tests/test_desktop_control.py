@@ -53,7 +53,11 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_health_identifies_athena_without_leaking_secrets(self):
         response = await health(None)
-        self.assertEqual(json.loads(response.text), {'ok': True, 'app': 'athena', 'monitor_schema': 1})
+        body = json.loads(response.text)
+        self.assertEqual({key: body[key] for key in ('ok', 'app', 'monitor_schema')},
+                         {'ok': True, 'app': 'athena', 'monitor_schema': 1})
+        self.assertIsInstance(body.get('version'), str)
+        self.assertNotIn('key', response.text.casefold())
 
     async def test_reboot_requires_auth_csrf_and_explicit_confirmation(self):
         transport=patch('athena.web.WINDOWS_HOST',False)

@@ -12,9 +12,9 @@ Return one valid JSON object with this exact shape:
 
 The summary should preserve ongoing topics, decisions, unresolved tasks, and
 important context in at most 180 words. Write it as a briefing for ATHENA, not as a
-diary: what is still live, what was decided, what is waiting on Benjamin.
+diary: what is still live, what was decided, what is waiting on the user.
 
-Facts should contain stable information about Benjamin: preferences, routines,
+Facts should contain stable information about the user: preferences, routines,
 relationships, devices, projects, goals, and communication style. Use short
 snake_case keys. Confidence must be 0 to 1. Return at most eight facts, and only
 facts that are new or changed.

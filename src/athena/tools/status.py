@@ -104,12 +104,16 @@ class CheckToolStatus:
 def is_status_question(text):
     text = text.casefold()
     return bool(re.search(r'\b(?:is|was|has|have|did|are)\b.*\b(?:finished|done|complete|completed|sent|sending|running|progress|failed|opened)\b'
-                          r'|\b(?:status|progress)\b|\b(?:have you sent|how much.*download|download.*speed)\b', text))
+                          r'|\b(?:status|progress)\b|\b(?:have you sent|how much.*download|download.*speed)\b'
+                          r'|\bhow\b.*\b(?:task|coding|openclaw)\b.*\bgoing\b'
+                          r'|\b(?:report on|task report|final report|what are you working on)\b'
+                          r'|\b(?:check|show|tell me)\b.*\b(?:the task|my task|that task|coding task)\b', text))
 
 
 def topic_tool(text):
     text = text.casefold()
     for pattern, tool in (
+        (r'\bopenclaw\b', 'openclaw_task'),
         (r'\b(?:subagents?|agents?|background|extensive|delegat\w*)\b', 'agent_task'),
         (r'\b(?:transfer|upload|sent|sending|(?:send|give).*\b(?:file|computer|pc))\b', 'upload_to_pc'),
         (r'\bdownload\w*\b', 'download_file'),

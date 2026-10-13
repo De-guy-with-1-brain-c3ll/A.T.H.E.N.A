@@ -196,8 +196,11 @@ class EdgeSynthesizer:
             raise RuntimeError(f"Edge speech is not usable: {reason}")
         try:
             import ssl
+            from athena.tts.edge_transport import configure_edge_transport
+            configure_edge_transport()
+            host = 'api.msedgeservices.com' if os.environ.get('ATHENA_EDGE_TRANSPORT')=='msedge' else 'speech.platform.bing.com'
             _, writer = await asyncio.wait_for(
-                asyncio.open_connection("speech.platform.bing.com", 443,
+                asyncio.open_connection(host, 443,
                                         ssl=ssl.create_default_context()),
                 timeout=5.0)
             writer.close()
@@ -246,6 +249,8 @@ class EdgeSynthesizer:
                     break
                 async with asyncio.timeout(SYNTHESIS_TIMEOUT_SECONDS):
                     import edge_tts
+                    from athena.tts.edge_transport import configure_edge_transport
+                    configure_edge_transport()
 
                     # Only send prosody that was actually configured. A no-op
                     # `pitch` is not free — see `edge_pitch` — so an unset
@@ -293,14 +298,11 @@ class EdgeSynthesizer:
             print(f"[speech] Edge synthesis failed: "
                   f"{type(error).__name__}: {error}", flush=True)
             await self._report_decoder()
-            self._publish(turn_id)
         else:
             if first_ms is None and drain_task is not None:
                 # Edge reported success but nothing decoded. Silence with no
                 # reason attached is the one failure mode worth extra work.
                 await self._report_decoder()
-            if self._turn_id == turn_id:
-                self._publish(turn_id)
         finally:
             if spawn is not None and not spawn.done():
                 spawn.cancel()
@@ -316,6 +318,8 @@ class EdgeSynthesizer:
                 self.last_first_byte_ms = first_ms
             self.last_total_ms = (loop.time() - started) * 1000
             await self._kill_process()
+            if self._turn_id == turn_id:
+                self._publish(turn_id)
             if self._pump_task is asyncio.current_task():
                 self._pump_task = None
 
@@ -410,14 +414,14 @@ class EdgeSynthesizer:
 
     async def _kill_process(self) -> None:
         process, self._process = self._process, None
-        if process is None or process.returncode is not None:
+        if process is None:
             return
         try:
-            process.kill()
+            if process.returncode is None: process.kill()
         except ProcessLookupError:
             pass
         try:
-            await asyncio.wait_for(process.wait(), timeout=5)
+            await asyncio.wait_for(process.communicate(), timeout=5)
         except (TimeoutError, ProcessLookupError):
             pass
 

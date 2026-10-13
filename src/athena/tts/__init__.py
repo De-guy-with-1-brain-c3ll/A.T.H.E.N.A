@@ -81,6 +81,9 @@ def build_synthesizer(settings, settings_store=None):
     substitution would hide the one failure worth knowing about.
     """
     backend = tts_backend()
+    if os.name == 'nt' and (backend in {'windows','sapi'} or backend=='edge' and os.environ.get('ATHENA_WINDOWS_TTS_BACKEND') == 'windows'):
+        from athena.tts.windows import WindowsSynthesizer
+        return WindowsSynthesizer()
     if backend == "edge":
         available, reason = edge_available()
         if available:
@@ -116,6 +119,8 @@ def synthesizer_sample_rate(settings) -> int:
     the wrong speed, which is much harder to attribute.
     """
     backend = tts_backend()
+    if os.name == 'nt' and (backend in {'windows','sapi'} or backend=='edge' and os.environ.get('ATHENA_WINDOWS_TTS_BACKEND') == 'windows'):
+        return 24000
     if backend == "edge" and edge_available()[0]:
         return edge_sample_rate()
     if backend in SHERPA_ALIASES and sherpa_available()[0]:

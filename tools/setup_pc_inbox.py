@@ -78,6 +78,9 @@ def main():
             print("PC receiver already stopped.")
         PID.unlink(missing_ok=True)
         return
+    if args.bind and args.bind.casefold() == 'auto':
+        from athena.pc_transfer import lan_address
+        args.bind = lan_address()
     if not args.bind or not ipaddress.ip_address(args.bind).is_private:
         parser.error("Supply --bind with this computer's private LAN IPv4 address.")
     if PID.exists():

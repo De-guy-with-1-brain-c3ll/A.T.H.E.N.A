@@ -28,6 +28,14 @@ def browser_audio_enabled() -> bool:
 
 async def run() -> None:
     load_local_environment()
+    from pathlib import Path
+    import json
+    try:
+        installed_engine = json.loads((Path(__file__).resolve().parents[2] / 'data/openclaw/athena-default.json').read_text())['engine']
+    except (OSError, ValueError, KeyError): installed_engine = 'legacy'
+    if os.name == 'nt' and os.environ.get('ATHENA_ENGINE', installed_engine) == 'openclaw':
+        from athena.core_client import run_voice
+        return await run_voice()
     settings_store = RuntimeSettingsStore()
     settings = Settings.from_environment(settings_store)
     # Browser mode keeps the assistant on this machine while the microphone and

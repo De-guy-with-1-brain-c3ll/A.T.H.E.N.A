@@ -11,7 +11,7 @@ class SettingsTool:
         name="manage_settings",
         description=(
             "List, inspect, change, or reset an approved ATHENA setting. Use this "
-            "when Benjamin asks to adjust sensitivity, timing, voice, response "
+            "when the user asks to adjust sensitivity, timing, voice, response "
             "length or creativity, language, or memory. Never use it for secrets."
         ),
         parameters={

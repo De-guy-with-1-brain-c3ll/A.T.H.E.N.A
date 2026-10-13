@@ -435,6 +435,11 @@ class DeepSeekLanguageModel:
         # Sending a status question through the model can turn a completed
         # download into another approval request or an unrelated canned reply.
         if self._interface != 'agent':
+            openclaw_status = self._tools.openclaw_status_arguments(text, context_messages)
+            if openclaw_status is not None:
+                result = await self._tools.execute('openclaw_status', openclaw_status)
+                yield result.spoken_text
+                return
             status = self._tools.contextual_status(text, context_messages)
             if status is not None:
                 yield status.spoken_text
@@ -475,13 +480,27 @@ class DeepSeekLanguageModel:
         # Stable compact catalogue, with schemas loaded by model choice rather
         # than keyword filtering. Common tiny readers are always available.
         selected_tools = available_tools & {"get_local_time", "check_tool_status"}
+        coding_request = creating_file or bool(
+            re.search(r'\b(?:code|coding|program|script|bug|tests?|refactor|athena)\b', text, re.I)
+            and re.search(r'\b(?:fix|debug|implement|refactor|update|change|edit|build|write|create|test)\b', text, re.I)
+            and not re.search(r'^\s*(?:how|explain|what)\b', text, re.I))
+        openclaw_coding = coding_request and 'openclaw_task' in available_tools and self._interface != 'agent'
+        if openclaw_coding:
+            selected_tools.update({'openclaw_task', 'openclaw_status'} & available_tools)
+        terminal_request = bool(re.search(r'\b(?:open|launch|start)\b', text, re.I)
+                                and re.search(r'\b(?:terminal|powershell|command prompt)\b', text, re.I)
+                                and not re.search(r'\b(?:how|explain)\b', text, re.I))
+        if terminal_request:
+            selected_tools.update(available_tools & {'pc_desktop'})
+        if re.search(r'\b(?:openclaw|desktop|computer|pc|automate|automation|commands?)\b', text, re.I):
+            selected_tools.update(available_tools & {'openclaw_task'})
         if vpn_request:
             selected_tools.update(available_tools & {'manage_vpn'})
         if music_request:
             selected_tools.update(available_tools & {music_tool})
         if sending_to_pc:
             selected_tools.update(available_tools & {'upload_to_pc', 'pc_transfer_status'})
-        if creating_file:
+        if creating_file and not openclaw_coding:
             selected_tools.update(available_tools & {'coding_workspace'})
         if assignment_question or re.search(r'\b(?:homework|assignments?|due)\b', text, re.I):
             selected_tools.update(available_tools & {'teams_assignments', 'teams_channels'})
@@ -515,7 +534,14 @@ class DeepSeekLanguageModel:
                 "Recover the requested song from conversation context for platform follow-ups. "
                 "Use play with the song query; no extra permission or generic web search is needed. "
                 "Only report playback after the tool succeeds; report its actual error otherwise."})
-        if creating_file:
+        if openclaw_coding:
+            state_messages.append({'role': 'system', 'content':
+                'OpenClaw is the configured coding tool. Delegate the complete requested coding objective '
+                'and constraints to openclaw_task; do not substitute coding_workspace. '
+                'Call openclaw_task with a flat JSON object containing only objective: {"objective":"full task"}. '
+                'The returned task ID means work was queued, not completed. Use openclaw_status for actual progress or the '
+                'final agent report. Never claim a file was written or tests passed from a submission receipt.'})
+        if creating_file and not openclaw_coding:
             state_messages.append({'role': 'system', 'content':
                 'The user requested an actual saved file. Use coding_workspace to create a '
                 'valid named project and write the requested file there. Code in your reply '
@@ -642,7 +668,11 @@ class DeepSeekLanguageModel:
             if definitions:
                 request["tools"] = definitions
                 request["tool_choice"] = "auto"
-                if _ == 0 and vpn_request and 'manage_vpn' in selected_tools:
+                if _ == 0 and terminal_request and 'pc_desktop' in selected_tools:
+                    request['tool_choice'] = {'type': 'function', 'function': {'name': 'pc_desktop'}}
+                elif _ == 0 and openclaw_coding:
+                    request['tool_choice'] = {'type': 'function', 'function': {'name': 'openclaw_task'}}
+                elif _ == 0 and vpn_request and 'manage_vpn' in selected_tools:
                     request['tool_choice'] = {'type': 'function', 'function': {'name': 'manage_vpn'}}
                 elif _ == 0 and music_request and music_tool in selected_tools:
                     request['tool_choice'] = {'type': 'function', 'function': {'name': music_tool}}
@@ -826,7 +856,7 @@ class DeepSeekLanguageModel:
                 # that verified time, not reinterpret the earlier timestamp.
                 actual = [row for row in tool_audit if row['name'] != 'select_tools']
                 action_names = {'coding_workspace', 'run_command', 'download_file', 'upload_to_pc',
-                    'pc_browser', 'set_alarm', 'cancel_alarm', 'manage_settings', 'netease_music',
+                    'pc_browser', 'pc_desktop', 'openclaw_task', 'set_alarm', 'cancel_alarm', 'manage_settings', 'netease_music',
                     'youtube_audio',
                     'manage_audio_devices', 'manage_vpn', 'watch_teams_channel', 'watch_weather',
                     'cancel_watch', 'background_workflow', 'agent_task'}
@@ -883,7 +913,7 @@ class DeepSeekLanguageModel:
                     (r'\b(?:created|written)\b', {'coding_workspace', 'run_command'}),
                     (r'\b(?:sent|transferred)\b', {'upload_to_pc', 'run_command'}),
                     (r'\bdownloaded\b', {'download_file', 'run_command'}),
-                    (r'\bopened\b', {'pc_browser', 'run_command'}),
+                    (r'\bopened\b', {'pc_browser', 'pc_desktop', 'run_command'}),
                 ):
                     if completion_claim and re.search(pattern, final, re.I):
                         confirmed_action = confirmed_action and any(
@@ -902,7 +932,7 @@ class DeepSeekLanguageModel:
                         continue
                     yield "I don't have a verified completion receipt for that action."
                     return
-                if ("coding_workspace" in available_tools and not self._tools.has_pending_approval
+                if ("coding_workspace" in available_tools and not openclaw_coding and not self._tools.has_pending_approval
                         and re.search(r"\b(?:create|write|build|make|program|python|test|proceed|yes|go ahead)\b", text, re.I)
                         and re.search(r"\b(?:should i|shall i|may i|would you like me|should i proceed)\b", lowered)
                         and not approval_repair_attempted):
@@ -998,7 +1028,7 @@ class DeepSeekLanguageModel:
                     if transfer.data.get('status') != 'none':
                         yield transfer.spoken_text
                         return
-                if creating_file and not upload_calls and not artifact_repaired and _ < round_limit - 1:
+                if creating_file and not openclaw_coding and not upload_calls and not artifact_repaired and _ < round_limit - 1:
                     written = any(item['name'] == 'coding_workspace' and item['success']
                         and item['arguments'].get('action') == 'write' for item in tool_audit)
                     if not written or sending_to_pc:
@@ -1091,6 +1121,15 @@ class DeepSeekLanguageModel:
                 function = call["function"]
                 try:
                     arguments = json.loads(function["arguments"] or "{}")
+                    # Some provider replies wrap the actual JSON arguments once.
+                    # Unwrap only this exact envelope; the hub still validates
+                    # every field and approval still comes from the real user.
+                    if function['name'] in {'openclaw_task', 'openclaw_status'} and isinstance(arguments, dict) and set(arguments) == {'arguments'}:
+                        wrapped = arguments['arguments']
+                        if isinstance(wrapped, str):
+                            wrapped = json.loads(wrapped)
+                        if isinstance(wrapped, dict):
+                            arguments = wrapped
                     if function['name'] == 'select_tools':
                         names = arguments.get('names')
                         if (not isinstance(names, list) or not 1 <= len(names) <= 6
@@ -1133,6 +1172,11 @@ class DeepSeekLanguageModel:
                                            'background_started', 'download_started', 'command_started', 'task_id'))})
                     if result.data.get("approval_required") or result.data.get("shutdown_requested"):
                         self._display_control(result)
+                        yield result.spoken_text
+                        return
+                    if function['name'] in {'openclaw_task', 'openclaw_status'}:
+                        # The receipt is the answer. A second model request can
+                        # stall after "I'll check", or resubmit an ambiguous start.
                         yield result.spoken_text
                         return
                     content = json.dumps(

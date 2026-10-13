@@ -113,7 +113,7 @@ def end_of_speech_tone(rate: int) -> bytes:
 class VoiceCoordinator:
     WAKE_ACKS = ("Yes, sir?", "What's up?", "I'm listening.", "Go ahead.",
                  "Ready.", "I'm here.", "How can I help?", "At your service.",
-                 "I'm listening, Benjamin.", "What do you need?")
+                 "I'm ready.", "What do you need?")
     # A command repeated seconds later is nearly always the user talking over a
     # slow answer, not a second request. Answering it twice sounds broken; one
     # free acknowledgement keeps him informed without another model call. If he
@@ -483,6 +483,18 @@ class VoiceCoordinator:
                             await self._speak_text(random.choice(self.WAKE_ACKS), prompted=True)
                             continue
                 if await self._handle_quiet_request(transcript):
+                    continue
+                if getattr(self.llm, 'gateway_backed', False):
+                    if await self._handle_fast_audio_control(transcript):
+                        continue
+                    if ToolRegistry.is_shutdown_command(transcript):
+                        await self._speak_text('Voice listening stopped. Agent tasks continue.')
+                        break
+                    job = self.background.submit(transcript, [])
+                    if job is None:
+                        await self._speak_text('Please let the current reply finish.')
+                    else:
+                        job.speech_eos_at = getattr(getattr(self, 'audio_status', None), '_payload', {}).get('eos_at')
                     continue
                 if ToolRegistry.is_shutdown_command(transcript):
                     await self.background.cancel_all()
@@ -1495,9 +1507,19 @@ class VoiceCoordinator:
         skipped_characters = 0
         print("A.T.H.E.N.A: ", end="", flush=True)
         try:
+            if getattr(self.llm, 'gateway_backed', False):
+                from athena.core_client import timed_fragments
+                fragments = timed_fragments(fragments)
             async for fragment in fragments:
                 if self.active_turn != turn_id:
                     return
+                if fragment is None:
+                    for clause in chunker.finish():
+                        if not self._budget_reached(spoken_characters):
+                            await emit(clause)
+                            spoken_characters += len(clause)
+                            sent_audio = True
+                    continue
                 response_parts.append(fragment)
                 print(fragment, end="", flush=True)
                 timing = getattr(self, '_reply_timing', {})
@@ -1612,6 +1634,8 @@ class VoiceCoordinator:
                 if not focused:
                     await focus.enter_async_context(self._audio_focus())
                     focused = True
+                    status = getattr(self,'audio_status',None)
+                    if callable(getattr(status,'state',None)): status.state('speaking')
                     timing = getattr(self, '_reply_timing', {})
                     if timing.get('turn') == turn_id:
                         from athena.metrics import record
@@ -1629,6 +1653,8 @@ class VoiceCoordinator:
                 played += len(chunk.pcm)
                 if collect is not None:
                     collect.append(chunk.pcm)
+        status = getattr(self,'audio_status',None)
+        if callable(getattr(status,'state',None)): status.state(WAITING)
         return played
 
     async def cancel_active_turn(self, reason: str = "interrupted") -> None:

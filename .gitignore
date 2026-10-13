@@ -44,3 +44,6 @@ motion/_rec_tmp/
 motion/_verify/
 motion/*.log
 motion/*.txt
+
+# Reproducible OpenClaw dependency cache; source and patches are versioned separately.
+/.pnpm-store/

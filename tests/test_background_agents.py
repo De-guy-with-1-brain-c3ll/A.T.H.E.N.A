@@ -55,6 +55,21 @@ class FakeModel:
 
 
 class BackgroundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failure_after_checking_preamble_reaches_speech_fragment_queue(self):
+        class BrokenStatusModel(FakeModel):
+            async def stream_reply(self, *args, **kwargs):
+                yield 'I will check the task. '
+                raise RuntimeError('private provider diagnostic')
+
+        hub = BackgroundAgents(BrokenStatusModel())
+        job = hub.submit('Check the task.', [])
+        await job.task
+        spoken = ''.join([part async for part in hub.reply_stream(job)])
+        self.assertIn('I will check the task.', spoken)
+        self.assertIn("couldn't finish", spoken)
+        self.assertNotIn('private provider diagnostic', spoken)
+        self.assertEqual(spoken, job.reply)
+
     async def test_first_fragment_is_deliverable_before_the_model_finishes(self):
         """Voice playback must not wait for the final token of a reply."""
         release = asyncio.Event()
@@ -150,7 +165,7 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
         hub.model = FailingModel()
         failed = hub.submit('bad', [])
         await failed.task
-        self.assertEqual(failed.reply, 'That request failed. Please try again.')
+        self.assertEqual(failed.reply, "I couldn't finish that request. No task completion was confirmed.")
         self.assertNotIn('private', failed.reply)
         await hub.cancel_all()
 

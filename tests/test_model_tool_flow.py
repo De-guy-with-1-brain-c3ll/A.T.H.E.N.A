@@ -14,6 +14,89 @@ from tests.test_search_refinement import Stream, chunk, call
 
 
 class ModelToolFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_selected_status_returns_receipt_without_second_model_request(self):
+        result = ToolResult(False, 'The PC bridge is offline; no task was restarted.')
+        reply, requests, tools = await self.run_case('Look at the OpenClaw job.',
+            [call('openclaw_status', {'action': 'status'}, 'status')],
+            ['openclaw_task', 'openclaw_status'], results={'openclaw_status': result})
+        self.assertEqual(reply, result.spoken_text)
+        self.assertEqual(len(requests), 1)
+        tools['openclaw_task'].execute.assert_not_awaited()
+
+    async def test_unconfirmed_start_returns_error_without_retry_or_empty_promise(self):
+        result = ToolResult(False, 'OpenClaw submission is unconfirmed. Check task abcdef123456 before retrying.',
+                            {'task_id': 'abcdef123456', 'status': 'unconfirmed'})
+        reply, requests, tools = await self.run_case('Fix this Python program.',
+            [call('openclaw_task', {'objective': 'Fix the Python program.'}, 'code')],
+            ['openclaw_task'], results={'openclaw_task': result})
+        self.assertEqual(reply, result.spoken_text)
+        self.assertEqual(len(requests), 1)
+        tools['openclaw_task'].execute.assert_awaited_once()
+
+    async def test_check_the_task_reads_live_status_of_existing_openclaw_task(self):
+        result = ToolResult(True, 'OpenClaw task abcdef123456 is running.')
+        def configure(registry, tools):
+            ident = registry.status_store.begin('openclaw_task', {})
+            registry.status_store.finish(ident, 'submitted', 'OpenClaw task abcdef123456 queued.')
+        reply, requests, tools = await self.run_case('Check the task.', [],
+            ['openclaw_status'], results={'openclaw_status': result}, configure=configure)
+        self.assertEqual(reply, result.spoken_text)
+        self.assertEqual(requests, [])
+        tools['openclaw_status'].execute.assert_awaited_once_with({'action': 'status'})
+
+    async def test_status_follows_conversation_task_across_interfaces_without_local_receipt(self):
+        registry = ToolRegistry()
+        registry.register(NS(definition=ToolDefinition('openclaw_status', 'status', {'type': 'object'}),
+                             execute=AsyncMock(return_value=ToolResult(True, 'Task running.'))))
+        args = registry.openclaw_status_arguments('Check the task.', [
+            {'role': 'user', 'content': 'Write a Python program.'},
+            {'role': 'assistant', 'content': 'OpenClaw task abcdef123456 queued.'}])
+        self.assertEqual(args, {'action': 'status', 'id': 'abcdef123456'})
+
+    async def test_coding_uses_openclaw_as_tool_and_reports_submission_only(self):
+        result = ToolResult(True, 'OpenClaw task abcdef123456 queued.',
+                            {'task_id': 'abcdef123456', 'background_started': True, 'status': 'queued'})
+        reply, requests, tools = await self.run_case('Write a Python program that prints hello world.',
+            [call('openclaw_task', {'objective': 'Write a Python program that prints hello world.'}, 'code')],
+            ['openclaw_task', 'openclaw_status', 'coding_workspace'], results={'openclaw_task': result})
+        self.assertEqual(requests[0]['tool_choice']['function']['name'], 'openclaw_task')
+        tools['coding_workspace'].execute.assert_not_awaited()
+        self.assertEqual(reply, result.spoken_text)
+        self.assertEqual(len(requests), 1)
+
+    async def test_status_fetches_actual_openclaw_report_without_model_or_new_task(self):
+        result = ToolResult(True, 'OpenClaw task abcdef123456: running. Latest recorded tool: exec (called).')
+        reply, requests, tools = await self.run_case('What is the status of OpenClaw task abcdef123456?', [],
+            ['openclaw_task', 'openclaw_status'], results={'openclaw_status': result})
+        self.assertEqual(reply, result.spoken_text)
+        self.assertEqual(requests, [])
+        tools['openclaw_status'].execute.assert_awaited_once_with({'action': 'status', 'id': 'abcdef123456'})
+        tools['openclaw_task'].execute.assert_not_awaited()
+
+    async def test_wrapped_openclaw_provider_arguments_still_use_real_tool(self):
+        result = ToolResult(True, 'OpenClaw task abcdef123456 queued.',
+                            {'task_id': 'abcdef123456', 'background_started': True})
+        reply, _, tools = await self.run_case('Fix the Python program.',
+            [call('openclaw_task', {'arguments': {'objective': 'Fix the Python program.'}}, 'code')],
+            ['openclaw_task'], results={'openclaw_task': result})
+        tools['openclaw_task'].execute.assert_awaited_once_with({'objective': 'Fix the Python program.'})
+        self.assertEqual(reply, result.spoken_text)
+
+    async def test_desktop_terminal_request_has_verified_tool_on_first_round(self):
+        reply, requests, tools = await self.run_case('Open a terminal on my desktop.',
+            [call('pc_desktop', {'action': 'open_terminal'}, 'terminal'),
+             Stream([chunk('I have opened a terminal on your PC.')])], ['pc_desktop', 'openclaw_task'])
+        self.assertEqual(requests[0]['tool_choice']['function']['name'], 'pc_desktop')
+        tools['pc_desktop'].execute.assert_awaited_once_with({'action': 'open_terminal'})
+        self.assertIn('opened', reply)
+        tools['openclaw_task'].execute.assert_not_awaited()
+
+    async def test_pc_automation_offers_openclaw_without_selector_round_trip(self):
+        _, requests, _ = await self.run_case('Automate organising files on my PC.',
+            [call('openclaw_task', {'objective': 'Organise PC files'}, 'agent'),
+             Stream([chunk('Agent reply received.')])], ['openclaw_task'])
+        self.assertIn('openclaw_task', {t['function']['name'] for t in requests[0]['tools']})
+
     async def test_vpn_request_calls_installed_control(self):
         _, requests, tools = await self.run_case('Athena, stop the VPN.',
             [call('manage_vpn', {'action': 'stop'}, 'vpn'), Stream([chunk('The VPN is stopped.')])], ['manage_vpn'])

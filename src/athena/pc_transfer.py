@@ -1,4 +1,4 @@
-"""Authenticated LAN inbox. No remote execution or arbitrary destination paths."""
+"""Authenticated LAN inbox and explicit PC actions, including OpenClaw delegation."""
 from __future__ import annotations
 
 import argparse
@@ -24,7 +24,7 @@ def signature(key, timestamp, nonce, filename, digest):
     return hmac.new(key.encode(), f"{timestamp}\n{nonce}\n{filename}\n{digest}".encode(), hashlib.sha256).hexdigest()
 
 
-def inbox_app(inbox, key, browser=None):
+def inbox_app(inbox, key, browser=None, desktop=None, openclaw=None):
     if len(key) < 32:
         raise ValueError("ATHENA_PC_TRANSFER_KEY must be at least 32 characters.")
     inbox = Path(inbox).resolve()
@@ -57,7 +57,7 @@ def inbox_app(inbox, key, browser=None):
                 raise ValueError("Invalid filename")
             if name.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL", *[f"COM{i}" for i in range(10)], *[f"LPT{i}" for i in range(10)]}:
                 raise ValueError("Reserved filename")
-            signed_name = f"POST:/browser:{name}" if request.path == "/browser" else name
+            signed_name = f"POST:{request.path}:{name}" if request.path in {'/browser', '/desktop', '/openclaw'} else name
             expected = signature(key, stamp, nonce, signed_name, digest)
             if not hmac.compare_digest(expected, request.headers.get("X-Athena-Signature", "")):
                 raise ValueError("Authentication failed")
@@ -70,26 +70,34 @@ def inbox_app(inbox, key, browser=None):
             seen[nonce] = now
         except (ValueError, KeyError, TypeError):
             raise web.HTTPForbidden(text="Invalid signed LAN request.") from None
-        if request.path == "/browser":
-            if browser is None:
-                raise web.HTTPServiceUnavailable(text="PC browser bridge is unavailable.")
+        if request.path in {'/browser', '/desktop', '/openclaw'}:
+            handler = {'/browser': browser, '/desktop': desktop, '/openclaw': openclaw}[request.path]
+            if handler is None:
+                raise web.HTTPServiceUnavailable(text="Requested PC bridge capability is unavailable.")
             chunks, size = [], 0
             async for chunk in request.content.iter_chunked(1024):
                 size += len(chunk)
-                if size > 10000: raise web.HTTPBadRequest(text="Browser request too large.")
+                if size > (80000 if request.path == '/openclaw' else 10000):
+                    raise web.HTTPBadRequest(text="PC action request too large.")
                 chunks.append(chunk)
             raw = b"".join(chunks)
             if hashlib.sha256(raw).hexdigest() != digest:
-                raise web.HTTPBadRequest(text="Invalid browser request.")
+                raise web.HTTPBadRequest(text="Invalid PC action request.")
             try:
                 body = json.loads(raw)
-                if not isinstance(body, dict): raise ValueError("Expected a browser action object.")
-                return web.json_response(await browser.execute(body))
+                if not isinstance(body, dict): raise ValueError("Expected a PC action object.")
+                if request.path == '/openclaw':
+                    from jsonschema import Draft202012Validator
+                    if not Draft202012Validator(handler.definition.parameters).is_valid(body):
+                        raise ValueError('Invalid OpenClaw task arguments.')
+                    result = await handler.execute(body)
+                    return web.json_response({'success': result.success, 'spoken_text': result.spoken_text, 'data': result.data})
+                return web.json_response(await handler.execute(body))
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
                 raise web.HTTPBadRequest(text=str(error)) from None
             except Exception:
-                logging.exception("PC browser action failed")
-                raise web.HTTPBadGateway(text="PC browser action failed; check the PC bridge log.") from None
+                logging.exception("PC bridge action failed")
+                raise web.HTTPBadGateway(text="PC action failed; check the PC bridge log.") from None
         # Never overwrite or execute received files. UUID prefix prevents both
         # collision and NTFS device names; the file is published only on success.
         target = inbox / f"{uuid4().hex[:10]}-{name}"
@@ -114,6 +122,8 @@ def inbox_app(inbox, key, browser=None):
     app.router.add_get("/identify", identify)
     app.router.add_post("/upload", receive)
     app.router.add_post("/browser", receive)
+    app.router.add_post("/desktop", receive)
+    app.router.add_post("/openclaw", receive)
     if browser is not None:
         async def close_browser(_app): await browser.close()
         app.on_cleanup.append(close_browser)
@@ -225,7 +235,10 @@ def main():
             f"--bind auto, or with one of those addresses.")
     from athena.pc_browser import PCBrowser
     browser = PCBrowser(args.inbox.parent / "data" / "pc-browser-profile")
-    web.run_app(inbox_app(args.inbox, os.environ.get("ATHENA_PC_TRANSFER_KEY", ""), browser),
+    from athena.pc_desktop import PCDesktop
+    from athena.tools.openclaw import OpenClawBridge
+    web.run_app(inbox_app(args.inbox, os.environ.get("ATHENA_PC_TRANSFER_KEY", ""), browser,
+                         PCDesktop(), OpenClawBridge()),
                 host=args.bind, port=args.port, access_log=None)
 
 

@@ -318,6 +318,7 @@ async def bootstrap(request: web.Request) -> web.Response:
     token = request.cookies.get(COOKIE, "")
     return web.json_response({
         "csrf": state.csrf(token), "service": status, "serviceLabel": label,
+        "tools": state.session.registry.names(),
         "prompts": {"system": read_prompt("system"), "memory": read_prompt("memory")},
     })
 
@@ -718,7 +719,12 @@ async def audio_stream(request: web.Request) -> web.WebSocketResponse:
 
 
 async def health(_: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "app": "athena", "monitor_schema": 1})
+    from athena.paths import PROJECT_ROOT
+    try:
+        version = (PROJECT_ROOT / 'orange_pi/VERSION').read_text().strip()
+    except OSError:
+        version = 'unknown'
+    return web.json_response({"ok": True, "app": "athena", "monitor_schema": 1, 'version': version})
 
 
 async def monitor_status(request: web.Request) -> web.Response:
