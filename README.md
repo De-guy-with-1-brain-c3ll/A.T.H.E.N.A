@@ -26,6 +26,12 @@ through credentials and pairing. Setup does not activate the microphone or play 
 - NetEase Cloud Music playback with pause, resume, skip, stop, and volume control
 - Signed local-network updates from a development computer to an Orange Pi
 
+## Optional OpenClaw PC agent
+
+The Windows development setup can delegate multi-step file, command and coding
+tasks to a private local OpenClaw installation while retaining ATHENA's existing
+voice and tools. See [OpenClaw setup and usage](docs/openclaw.md).
+
 ## Quick start
 
 Requirements: Python 3.11 or newer, PortAudio, and FFmpeg.

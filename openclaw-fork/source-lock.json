@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/openclaw/openclaw.git",
+  "tag": "v2026.8.1",
+  "commit": "ea806575e6450e4d1efdfc72c19f04be982a1b9b",
+  "node": "26.11.1",
+  "plugin": "athena-plugin",
+  "runtimeFallback": "runtime-stable",
+  "automaticUpgrades": false,
+  "pnpm": "12.1.0",
+  "archiveSha256": "5d540c9b44313e0fd3e8fc9cc5767378ba428631e920513a28e70bc9d6669c68",
+  "lockfileSha256": "29ef7f52da43b3c131573912a30079c5ff6812586fb9b647438bc54c39a531fd",
+  "patches": [
+    "patches/0001-windows-native-build.patch"
+  ]
+}

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "athena-console"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Lightweight terminal client for the local ATHENA OpenClaw core"
+dependencies = []
+
+[project.scripts]
+athena = "athena_console:main"
+
+[tool.setuptools]
+py-modules = ["athena_console", "athena_dashboard"]

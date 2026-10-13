@@ -1,0 +1,92 @@
+--- a/scripts/build-all.mts
++++ b/scripts/build-all.mts
+@@ -558,6 +558,7 @@
+         options: {
+           stdio: "inherit",
+           env,
++          shell: false,
+         } satisfies SpawnSyncOptions,
+       };
+     }
+@@ -586,6 +587,8 @@
+     options: {
+       stdio: "inherit",
+       env,
++      // Native Node accepts file URL preloads; cmd.exe would reinterpret encoded paths.
++      shell: false,
+     } satisfies SpawnSyncOptions,
+   };
+ }
+--- a/test/scripts/build-all.test.ts
++++ b/test/scripts/build-all.test.ts
+@@ -24,6 +24,7 @@
+   runBuildAllSteps,
+   writeBuildAllStepCacheStamp,
+ } from "../../scripts/build-all.mts";
++import { createManagedCommandSpawnSpec } from "../../scripts/lib/managed-child-process.mts";
+ import {
+   listPluginSdkDistArtifacts,
+   listPluginSdkDeclarationOutputs,
+@@ -101,6 +102,30 @@
+ }
+ 
+ describe("resolveBuildAllStep", () => {
++  it.each([false, true])(
++    "keeps native Node build arguments out of the Windows shell (fallback=%s)",
++    (fallback) => {
++      const invocation = resolveBuildAllStep(
++        fallback ? getBuildAllStep("ui:build") : getBuildAllStep("tsdown-ai"),
++        {
++          platform: "win32",
++          nodeExecPath: "C:\\Program Files\\nodejs\\node.exe",
++          env: fallback ? { OPENCLAW_BUILD_ALL_NO_PNPM: "1" } : {},
++        },
++      );
++      const args = ["--import", "file:///C:/ATHENA%20SOURCE/scripts/tsx.mjs", ...invocation.args];
++      const spawned = createManagedCommandSpawnSpec({
++        bin: invocation.command,
++        args,
++        platform: "win32",
++        ...invocation.options,
++      });
++      expect(spawned.command).toBe("C:\\Program Files\\nodejs\\node.exe");
++      expect(spawned.args).toEqual(args);
++      expect(spawned.options.shell).toBe(false);
++    },
++  );
++
+   it("pins one generated timestamp across every child build", () => {
+     const commit = "0123456789abcdef0123456789abcdef01234567";
+     const buildEnv = resolveBuildAllEnvironment(
+@@ -217,6 +242,7 @@
+       options: {
+         stdio: "inherit",
+         env: { FOO: "bar" },
++        shell: false,
+       },
+     });
+   });
+@@ -251,6 +277,7 @@
+       options: {
+         stdio: "inherit",
+         env: expectedEnv,
++        shell: false,
+       },
+     });
+   });
+@@ -269,6 +296,7 @@
+       options: {
+         stdio: "inherit",
+         env: { OPENCLAW_BUILD_ALL_NO_PNPM: "1" },
++        shell: false,
+       },
+     });
+   });
+@@ -285,6 +313,7 @@
+       options: {
+         stdio: "inherit",
+         env: { OPENCLAW_BUILD_ALL_NO_PNPM: "1" },
++        shell: false,
+       },
+     });
+   });
