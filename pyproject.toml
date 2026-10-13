@@ -35,6 +35,7 @@ dependencies = [
   "tzdata>=2024.1; platform_system == 'Windows'",
   "psutil>=6,<8",
   "cryptography>=42",
+  "Pillow>=11,<13; platform_system == 'Windows'",
 ]
 
 [tool.setuptools.packages.find]
@@ -53,3 +54,22 @@ athena-pc-inbox = "athena.pc_transfer:main"
 athena-teams-login = "athena.tools.teams:login"
 athena-teams-check = "athena.tools.teams:check"
 athena-sleep = "athena.sleep:main"
+athena-openclaw = "athena.openclaw:main"
+athena-core = "athena.core:main"
+
+[tool.pytest.ini_options]
+# Everything but tests/ is runtime state: data/ holds the OpenClaw source and its
+# self-improvement worktrees (full repo copies), outputs/ holds probe virtualenvs.
+# Collecting them duplicates test module basenames and breaks the whole run.
+testpaths = ["tests"]
+norecursedirs = [
+  "data",
+  "outputs",
+  "motion",
+  "orange_pi",
+  "packages",
+  "openclaw-fork",
+  ".venv",
+  "build",
+  "dist",
+]
