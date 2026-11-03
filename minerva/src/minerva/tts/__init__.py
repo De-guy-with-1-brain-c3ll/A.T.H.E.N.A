@@ -1,4 +1,4 @@
-"""Speech synthesis backends, chosen by ATHENA_TTS_BACKEND."""
+﻿"""Speech synthesis backends, chosen by ATHENA_TTS_BACKEND."""
 from __future__ import annotations
 
 import os
@@ -46,8 +46,7 @@ def speech_is_billed(synthesizer=None) -> bool:
     """Whether the configured voice costs money per character.
 
     The coordinator prints a cost estimate after every reply, and printing a price
-    next to a free voice reads as though the free voice is not really being used —
-    which is exactly the thing a person switching to it is trying to confirm.
+    next to a free voice reads as though the free voice is not really being used 鈥?    which is exactly the thing a person switching to it is trying to confirm.
     """
     if synthesizer is not None:
         return isinstance(synthesizer, QwenRealtimeSynthesizer)
@@ -57,7 +56,7 @@ def speech_is_billed(synthesizer=None) -> bool:
 def speech_cost_label(synthesizer=None) -> str:
     """What to print in place of a price, for a voice that costs nothing.
 
-    Edge is free but it is not *local* — it is Microsoft's servers — and calling it
+    Edge is free but it is not *local* 鈥?it is Microsoft's servers 鈥?and calling it
     local in the log would be the same kind of small lie as printing a price for
     it. The distinction matters when diagnosing: a network voice that goes quiet
     has a different cause from a local one.
@@ -77,7 +76,7 @@ def build_synthesizer(settings, settings_store=None):
 
     The order of preference is therefore edge, then a local voice, then the cloud.
     Each falls back rather than leaving ATHENA mute, and every fallback prints why
-    — an unofficial service like Edge can stop working without notice, so a silent
+    鈥?an unofficial service like Edge can stop working without notice, so a silent
     substitution would hide the one failure worth knowing about.
     """
     backend = tts_backend()
@@ -113,8 +112,8 @@ def build_synthesizer(settings, settings_store=None):
 def synthesizer_sample_rate(settings) -> int:
     """The rate the speaker must be opened at for the chosen backend.
 
-    Every backend has its own rate — Edge and the cloud voice are 24 kHz, a VITS
-    Piper voice is 22.05 kHz — so this follows the backend rather than a single
+    Every backend has its own rate 鈥?Edge and the cloud voice are 24 kHz, a VITS
+    Piper voice is 22.05 kHz 鈥?so this follows the backend rather than a single
     fixed setting. Getting it wrong is not silence: it is the same audio played at
     the wrong speed, which is much harder to attribute.
     """
@@ -128,3 +127,4 @@ def synthesizer_sample_rate(settings) -> int:
     if backend == "piper" and piper_available()[0]:
         return piper_sample_rate()
     return settings.tts_sample_rate
+

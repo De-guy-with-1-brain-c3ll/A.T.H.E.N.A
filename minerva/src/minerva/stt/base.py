@@ -1,10 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from typing import Protocol
 from uuid import UUID
 
-from athena.events import Transcript
+from minerva.events import Transcript
 
 
 class SpeechRecognizer(Protocol):
@@ -14,3 +14,4 @@ class SpeechRecognizer(Protocol):
     def results(self) -> AsyncIterator[Transcript]: ...
     async def finish_turn(self) -> None: ...
     async def close(self) -> None: ...
+

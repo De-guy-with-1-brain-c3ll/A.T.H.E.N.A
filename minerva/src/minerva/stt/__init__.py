@@ -1,4 +1,4 @@
-"""Speech recognition backends, chosen by ATHENA_STT_BACKEND."""
+﻿"""Speech recognition backends, chosen by ATHENA_STT_BACKEND."""
 from __future__ import annotations
 
 import os
@@ -25,7 +25,7 @@ def build_recognizer(settings):
     runs on this machine and costs nothing. If local recognition is asked for but
     is not usable, the cloud recogniser is returned instead of leaving ATHENA
     unable to hear, and the reason is printed so it is not a silent substitution
-    — the same arrangement the synthesizer factory uses.
+    鈥?the same arrangement the synthesizer factory uses.
     """
     if stt_backend() == "sensevoice":
         available, reason = sensevoice_available()
@@ -70,3 +70,4 @@ def build_local_wake_recognizer(settings):
               flush=True)
         return None
     return SenseVoiceRecognizer(settings.stt_sample_rate)
+

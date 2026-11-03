@@ -1,23 +1,23 @@
-"""Local speech recognition with SenseVoice-Small, through sherpa-onnx.
+﻿"""Local speech recognition with SenseVoice-Small, through sherpa-onnx.
 
-The cloud recognisers bill by the second: ¥0.00033 per audio second, about
-¥1.19 an hour of speech, on every model the platform offers. Nothing about that
+The cloud recognisers bill by the second: 楼0.00033 per audio second, about
+楼1.19 an hour of speech, on every model the platform offers. Nothing about that
 price can be tuned by picking a different one. The only way down is to stop
-sending the audio anywhere, which is what this backend does — it runs entirely
+sending the audio anywhere, which is what this backend does 鈥?it runs entirely
 on the board, costs nothing per hour, needs no API key and works with no
 network at all.
 
 Measured 2026-09-17 on this project's own clips: 45-75x realtime on four
 threads, 22x on a single thread. A three second utterance decodes in 0.049s, so
 decoding is not the cost of a turn. The cost is the 229 MB model load, and that
-is paid once at start-up rather than per turn — the same reason the Piper
+is paid once at start-up rather than per turn 鈥?the same reason the Piper
 synthesizer holds its process open.
 
 The central problem this module solves is that SenseVoice is not a streaming
 model. It sees a finished utterance and returns text, while the coordinator
 wants the cloud shape: audio arrives in 100 ms packets and partial transcripts
 trickle back as someone speaks. The bridge is to keep a growing audio buffer and
-re-decode it — on a background worker, never on the event loop — each time
+re-decode it 鈥?on a background worker, never on the event loop 鈥?each time
 enough new speech has arrived. Because decoding is ~50x realtime, re-reading the
 whole utterance every time is affordable, and it is what makes the partials
 *replace* each other the way the cloud partials do, instead of accumulating.
@@ -31,7 +31,7 @@ from pathlib import Path
 import time
 from uuid import UUID
 
-from athena.events import Transcript
+from minerva.events import Transcript
 from athena.stt.fun_asr import PACKET_BYTES
 
 
@@ -40,8 +40,7 @@ from athena.stt.fun_asr import PACKET_BYTES
 DEFAULT_SAMPLE_RATE = 16_000
 
 # How much new audio must arrive before a partial is worth producing. SenseVoice
-# needs a little context to be meaningful — one 100 ms packet contains no words —
-# so partials are emitted at most after this much new speech. 800 ms keeps the
+# needs a little context to be meaningful 鈥?one 100 ms packet contains no words 鈥?# so partials are emitted at most after this much new speech. 800 ms keeps the
 # first partial early enough to feel responsive while giving the model a syllable
 # or two of real content to work with.
 PARTIAL_INTERVAL_SECONDS = 0.8
@@ -142,8 +141,8 @@ def sensevoice_available() -> tuple[bool, str]:
 def strip_tags(text: str) -> str:
     """Remove SenseVoice's bracketed markers, keeping the words.
 
-    The tags arrive at the front and are run together — `<|en|><|NEUTRAL|>
-    <|Speech|><|woitn|>` — so the leading run is removed and anything left
+    The tags arrive at the front and are run together 鈥?`<|en|><|NEUTRAL|>
+    <|Speech|><|woitn|>` 鈥?so the leading run is removed and anything left
     behind elsewhere is removed too rather than left to be spoken. A stray `<`
     from a half-recognised tag would otherwise survive into the transcript.
     """
@@ -352,7 +351,7 @@ class SenseVoiceRecognizer:
 
         One decode runs at a time. Audio keeps arriving while the worker thread
         is busy, and it lands in the buffer that the next decode reads, so a
-        decode that is overtaken by new speech is not wasted — the newer audio is
+        decode that is overtaken by new speech is not wasted 鈥?the newer audio is
         already included in whichever decode runs next.
         """
         async with self._lock:
@@ -474,3 +473,4 @@ class SenseVoiceRecognizer:
             self._loop.call_soon_threadsafe(put)
         except RuntimeError:
             pass
+

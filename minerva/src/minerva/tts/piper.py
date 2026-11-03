@@ -1,12 +1,12 @@
-"""Local speech with Piper: no network, no API key, no per-character cost.
+﻿"""Local speech with Piper: no network, no API key, no per-character cost.
 
 Piper runs on CPU-only ARM at roughly eight times realtime, so an Orange Pi can
 synthesize speech faster than it plays. That makes it the right default for heavy
-use: the cloud voice costs ¥1 per 10,000 characters, and every TTS on that
+use: the cloud voice costs 楼1 per 10,000 characters, and every TTS on that
 platform costs the same, so the only way to stop paying by the word is to stop
 sending the words anywhere.
 
-The trade is voice quality. Piper is clearly synthetic — clean and intelligible,
+The trade is voice quality. Piper is clearly synthetic 鈥?clean and intelligible,
 not as natural as the cloud voice. `ATHENA_TTS_BACKEND=qwen` keeps the cloud
 voice for when that matters.
 
@@ -27,11 +27,11 @@ import shutil
 import unicodedata
 from uuid import UUID
 
-from athena.events import AudioChunk
+from minerva.events import AudioChunk
 
 
 # Piper's medium English voices are 22.05 kHz mono 16-bit. The speaker is opened
-# at this rate, so no resampling is needed — and resampling speech is exactly the
+# at this rate, so no resampling is needed 鈥?and resampling speech is exactly the
 # kind of thing that quietly degrades quality.
 DEFAULT_SAMPLE_RATE = 22_050
 DEFAULT_VOICE = "en_US-lessac-medium"
@@ -111,7 +111,7 @@ def piper_environment() -> dict[str, str]:
     process sits on the next sentence instead of synthesizing what it already
     has: audio for one sentence appears and then the stream stalls with the
     process healthy and no EOF. The visible symptom is a warm process that
-    answers the first reply and then goes silent forever — and closing stdin to
+    answers the first reply and then goes silent forever 鈥?and closing stdin to
     shake it loose destroys the process this whole design is built to reuse.
 
     Unbuffered mode removes the read-ahead, restoring one line in, one sentence
@@ -126,15 +126,15 @@ def piper_input_text(text: str) -> str:
     """Make streamed assistant prose safe for Piper's Windows CLI parser.
 
     The installed Piper build can silently produce no audio for a spaced em dash
-    (``"Got it — CJ"``), even though the same words with ASCII punctuation work.
+    (``"Got it 鈥?CJ"``), even though the same words with ASCII punctuation work.
     Models regularly emit typographic punctuation, so convert those presentation
     characters before sending a line. This is intentionally limited to English
     punctuation; it does not strip ordinary non-ASCII words from another voice.
     """
     replacements = str.maketrans({
-        "—": "-", "–": "-", "−": "-",
-        "“": '"', "”": '"', "„": '"',
-        "‘": "'", "’": "'", "…": "...",
+        "鈥?: "-", "鈥?: "-", "鈭?: "-",
+        "鈥?: '"', "鈥?: '"', "鈥?: '"',
+        "鈥?: "'", "鈥?: "'", "鈥?: "...",
         "\u00a0": " ",
     })
     # NFKC also turns full-width ASCII punctuation into the form Piper expects.
@@ -152,7 +152,7 @@ def find_voice(name: str) -> Path | None:
             return candidate
     # Only search by bare name. A name that still looks like a path would be an
     # absolute pattern, which rglob refuses, and a missing voice is a configuration
-    # mistake the caller reports — it must not be a crash in the constructor.
+    # mistake the caller reports 鈥?it must not be a crash in the constructor.
     if "/" not in name and "\\" not in name and folder.is_dir():
         matches = sorted(folder.rglob(f"{name}.onnx"))
         if matches:
@@ -208,7 +208,7 @@ class PiperSynthesizer:
         self._settings = settings
         self._idle_seconds = piper_idle_seconds() if idle_seconds is None else idle_seconds
         # When a turn ends there is nothing left to read, so a line means
-        # "done". No idle window runs during a turn — a slow speaker must never
+        # "done". No idle window runs during a turn 鈥?a slow speaker must never
         # lose the middle of a reply to a timer.
         self._turn_timeout = piper_turn_timeout_seconds()
         self._warm_timeout = piper_warm_timeout_seconds()
@@ -264,7 +264,7 @@ class PiperSynthesizer:
         keeping: Piper takes ~1.8s to load a voice, but starting the executable
         takes 8ms because the load happens lazily on the first line it reads.
         A warm-up that only spawns therefore returns immediately and buys
-        nothing — the first real reply still waits. The voice is loaded by
+        nothing 鈥?the first real reply still waits. The voice is loaded by
         actually synthesizing something and throwing the audio away.
 
         The process is started *after* the warm-up phrase is done, so the pump
@@ -322,7 +322,7 @@ class PiperSynthesizer:
         """Read and discard audio until it stops coming, which ends the load.
 
         Audio must be *seen* before its absence means anything. Piper is silent
-        for the whole of the model load — most of two seconds — so a quiet poll
+        for the whole of the model load 鈥?most of two seconds 鈥?so a quiet poll
         on its own returns before the voice is ready and the warm-up buys
         nothing while appearing to succeed. Nothing else is reading the stream
         while this runs, so the pause after the warm-up sentence is observed
@@ -429,7 +429,7 @@ class PiperSynthesizer:
 
         One reader for the life of the process. Audio is attributed to whatever
         turn is current when it arrives, so a reply that streams faster than the
-        speaker consumes it is never dropped — the same rule the cloud
+        speaker consumes it is never dropped 鈥?the same rule the cloud
         synthesizer follows. Stale turns are rejected by `turn_id` in the
         coordinator, not here.
         """
@@ -576,14 +576,14 @@ class PiperSynthesizer:
         await self.cancel(self._turn_id, retire=True)
 
     async def cancel(self, turn_id: UUID | None, *, retire: bool = False) -> None:
-        """End a turn's audio immediately — without killing the process.
+        """End a turn's audio immediately 鈥?without killing the process.
 
         Ending a turn is not the same as retiring the process. A barge-in, or
         the coordinator's cleanup after a reply has fully played, only needs
         this turn to stop: the sentinel is published so any consumer returns,
         and the pump drops whatever Piper is still producing. The process
         itself stays warm, because killing it here made every reply pay the
-        ~1.8s voice load again on the next turn — the one cost this backend
+        ~1.8s voice load again on the next turn 鈥?the one cost this backend
         exists to avoid. `retire=True` (idle expiry, close) is the only path
         that really throws the process away.
         """
@@ -622,3 +622,4 @@ class PiperSynthesizer:
 
     async def close(self) -> None:
         await self.cancel(self._turn_id, retire=True)
+

@@ -1,10 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from typing import Protocol
 from uuid import UUID
 
-from athena.events import AudioChunk
+from minerva.events import AudioChunk
 
 
 class SpeechSynthesizer(Protocol):
@@ -14,3 +14,4 @@ class SpeechSynthesizer(Protocol):
     async def flush(self, turn_id: UUID) -> None: ...
     async def cancel(self, turn_id: UUID) -> None: ...
     async def close(self) -> None: ...
+
