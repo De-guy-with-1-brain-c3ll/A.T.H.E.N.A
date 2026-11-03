@@ -32,7 +32,7 @@ import time
 from uuid import UUID
 
 from minerva.events import Transcript
-from athena.stt.fun_asr import PACKET_BYTES
+from minerva.stt.fun_asr import PACKET_BYTES
 
 
 # SenseVoice reads 16 kHz mono. The microphone already delivers that, and the
@@ -473,4 +473,5 @@ class SenseVoiceRecognizer:
             self._loop.call_soon_threadsafe(put)
         except RuntimeError:
             pass
+
 

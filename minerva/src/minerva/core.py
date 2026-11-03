@@ -70,16 +70,29 @@ class MinervaCoordinator:
 
     async def _ask_openclaw(self, transcript: str) -> str:
         """Run one OpenClaw agent turn and return the reply text."""
-        from athena.openclaw import run_task
+        import subprocess
 
-        success, reply, meta = await run_task(
-            objective=transcript,
-            timeout=300,
-            session="minerva-" + uuid4().hex,
+        result = await asyncio.create_subprocess_exec(
+            "openclaw", "infer", "model", "run",
+            "--model", "deepseek/deepseek-flash",
+            "--prompt", transcript,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if not success:
-            return f"(OpenClaw did not confirm completion) {reply}"
-        return reply
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                result.communicate(), timeout=120
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            if result.returncode is None:
+                result.kill()
+            await result.communicate()
+            return "(OpenClaw timed out)"
+
+        if result.returncode != 0:
+            return f"(OpenClaw failed: {stderr.decode(errors='replace')[:200]})"
+
+        return stdout.decode("utf-8", errors="replace").strip()
 
     async def _speak(self, text: str) -> None:
         """Synthesize and play text via local TTS."""

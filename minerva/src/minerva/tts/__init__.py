@@ -128,3 +128,4 @@ def synthesizer_sample_rate(settings) -> int:
         return piper_sample_rate()
     return settings.tts_sample_rate
 
+

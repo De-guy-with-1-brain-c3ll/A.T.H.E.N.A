@@ -71,3 +71,4 @@ def build_local_wake_recognizer(settings):
         return None
     return SenseVoiceRecognizer(settings.stt_sample_rate)
 
+

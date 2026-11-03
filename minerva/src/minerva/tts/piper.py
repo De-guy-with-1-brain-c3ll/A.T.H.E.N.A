@@ -623,3 +623,4 @@ class PiperSynthesizer:
     async def close(self) -> None:
         await self.cancel(self._turn_id, retire=True)
 
+
